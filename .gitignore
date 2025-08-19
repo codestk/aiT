@@ -1,5 +1,5 @@
 outputs/
 data/
-run/
- *.pt
- *.mp4
+runs/
+*.pt
+*.mp4

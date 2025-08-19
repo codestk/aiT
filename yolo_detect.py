@@ -95,8 +95,8 @@ class Worker(QThread):
                 classname = labels[classidx]
                 self.detection_summary[classname] = self.detection_summary.get(classname, 0) + 1
                 label = f'{classname}: {int(conf*100)}%'
-                cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (66, 135, 245), 2)
+                cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (66, 135, 245), 2)
 
         if object_found and self.autosave_enabled:
             self.save_detection_images(original_frame, detected_frame, is_single_image=True)
@@ -153,8 +153,8 @@ class Worker(QThread):
                     classname = labels[classidx]
                     self.detection_summary[classname] = self.detection_summary.get(classname, 0) + 1
                     label = f'{classname}: {int(conf*100)}%'
-                    cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                    cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (15, 52, 112), 2)
+                    cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (47, 15, 112), 2)
             
             if object_found_in_frame and self.autosave_enabled:
                 self.save_detection_images(original_frame, detected_frame)
@@ -276,7 +276,7 @@ class MainWindow(QMainWindow):
 
         self.fps_label = QLabel("Processing Rate:")
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["Full Speed", "20 FPS", "15 FPS", "10 FPS", "5 FPS"])
+        self.fps_combo.addItems(["Full Speed","30 FPS", "25 FPS" ,"20 FPS", "15 FPS", "10 FPS", "5 FPS", "2 FPS", "1 FPS"])
         self.fps_combo.setCurrentIndex(self.config.get("fps_index", 0))
 
         self.start_button = QPushButton("Start Detection")

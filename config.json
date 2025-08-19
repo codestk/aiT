@@ -1,8 +1,8 @@
 {
     "model_path": "D:/aiT/runs/detect/train/weights/best.pt",
     "source_path": "1",
-    "threshold": 0.52,
+    "threshold": 0.62,
     "autosave": false,
-    "fps_index": 4,
+    "fps_index": 7,
     "save_original": false
 }
