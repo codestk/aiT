@@ -1,0 +1,275 @@
+import sys
+import os
+import json
+import time
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton, 
+                             QSlider, QVBoxLayout, QHBoxLayout, QGridLayout, 
+                             QLineEdit, QFileDialog, QMessageBox)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
+import cv2
+from ultralytics import YOLO
+
+# --- ส่วนจัดการไฟล์ Config ---
+CONFIG_FILE = 'config.json'
+
+def load_config():
+    """โหลดค่าล่าสุดจากไฟล์ config.json"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+def save_config(data):
+    """บันทึกค่าลงในไฟล์ config.json"""
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+# --- Worker Thread สำหรับการประมวลผล YOLO ---
+class Worker(QThread):
+    # Signal ที่จะส่งภาพที่ประมวลผลแล้วกลับไปที่ Main Thread
+    image_update = pyqtSignal(QPixmap)
+    # Signal สำหรับส่งข้อความสถานะ
+    status_update = pyqtSignal(str)
+    # Signal เมื่อการทำงานเสร็จสิ้น
+    finished = pyqtSignal()
+
+    def __init__(self, model_path, source, initial_thresh):
+        super().__init__()
+        self.model_path = model_path
+        self.source = source
+        self.threshold = initial_thresh
+        self._is_running = True
+
+    def run(self):
+        """
+        ฟังก์ชันนี้จะทำงานใน Thread แยกต่างหาก
+        นำโค้ด YOLO เดิมมาใส่ในนี้
+        """
+        try:
+            self.status_update.emit("Loading YOLO model...")
+            model = YOLO(self.model_path)
+            labels = model.names
+            self.status_update.emit(f"Model loaded. Opening source: {self.source}")
+
+            # ตรวจสอบแหล่งที่มาของภาพ
+            try:
+                # ลองแปลงเป็นตัวเลขสำหรับ webcam index
+                source_index = int(self.source)
+                cap = cv2.VideoCapture(source_index)
+            except ValueError:
+                # ถ้าไม่ใช่ตัวเลข แสดงว่าเป็น path
+                cap = cv2.VideoCapture(self.source)
+            
+            if not cap.isOpened():
+                raise IOError(f"Cannot open source: {self.source}")
+
+            self.status_update.emit("Processing...")
+            while self._is_running:
+                ret, frame = cap.read()
+                if not ret:
+                    break # จบวิดีโอ
+
+                # Run inference on frame
+                results = model(frame, verbose=False)
+                detections = results[0].boxes
+                
+                object_count = 0
+                # วาด Bounding Box
+                for i in range(len(detections)):
+                    conf = detections[i].conf.item()
+                    
+                    # ใช้ค่า threshold ที่อัปเดตจาก slider
+                    if conf > self.threshold:
+                        object_count += 1
+                        xyxy = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
+                        xmin, ymin, xmax, ymax = xyxy
+                        
+                        classidx = int(detections[i].cls.item())
+                        classname = labels[classidx]
+                        
+                        label = f'{classname}: {int(conf*100)}%'
+                        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+                        cv2.putText(frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # แสดงจำนวน Object
+                cv2.putText(frame, f'Objects: {object_count}', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+
+                # แปลงภาพ OpenCV (BGR) เป็น QPixmap (RGB) เพื่อแสดงผลใน PyQt
+                rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                pixmap = QPixmap.fromImage(qt_image)
+                
+                # ส่งภาพกลับไปที่ Main Thread ผ่าน Signal
+                self.image_update.emit(pixmap)
+                
+                # หน่วงเวลาเล็กน้อยเพื่อให้ GUI ตอบสนอง
+                time.sleep(0.01)
+
+            cap.release()
+            
+        except Exception as e:
+            self.status_update.emit(f"Error: {e}")
+        finally:
+            self.finished.emit()
+
+
+    def stop(self):
+        self._is_running = False
+
+# --- หน้าต่างหลักของโปรแกรม ---
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("YOLO Object Detection GUI")
+        self.setGeometry(100, 100, 1000, 800)
+
+        # โหลดค่า config ล่าสุด
+        self.config = load_config()
+
+        self.worker = None
+
+        # --- สร้าง Widgets ---
+        # Model Path
+        self.model_label = QLabel("YOLO Model Path:")
+        self.model_path_input = QLineEdit(self.config.get("model_path", ""))
+        self.model_browse_button = QPushButton("Browse...")
+        
+        # Source Path
+        self.source_label = QLabel("Source (File/Webcam Index):")
+        self.source_path_input = QLineEdit(self.config.get("source_path", "0"))
+        self.source_browse_button = QPushButton("Browse File...")
+
+        # Threshold Slider
+        self.thresh_label = QLabel("Confidence Threshold:")
+        self.thresh_slider = QSlider(Qt.Orientation.Horizontal)
+        self.thresh_slider.setRange(0, 100)
+        initial_thresh = int(self.config.get("threshold", 0.5) * 100)
+        self.thresh_slider.setValue(initial_thresh)
+        self.thresh_value_label = QLabel(f"{initial_thresh/100:.2f}")
+
+        # Buttons
+        self.start_button = QPushButton("Start Detection")
+        self.stop_button = QPushButton("Stop Detection")
+        self.stop_button.setEnabled(False)
+
+        # Image Display
+        self.image_display_label = QLabel("Press 'Start Detection' to begin")
+        self.image_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_display_label.setStyleSheet("background-color: black; color: white;")
+        
+        # Status Label
+        self.status_label = QLabel("Ready")
+
+        # --- จัด Layout ---
+        control_layout = QGridLayout()
+        control_layout.addWidget(self.model_label, 0, 0)
+        control_layout.addWidget(self.model_path_input, 0, 1, 1, 2)
+        control_layout.addWidget(self.model_browse_button, 0, 3)
+        control_layout.addWidget(self.source_label, 1, 0)
+        control_layout.addWidget(self.source_path_input, 1, 1, 1, 2)
+        control_layout.addWidget(self.source_browse_button, 1, 3)
+        control_layout.addWidget(self.thresh_label, 2, 0)
+        control_layout.addWidget(self.thresh_slider, 2, 1)
+        control_layout.addWidget(self.thresh_value_label, 2, 2, 1, 2)
+        
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.stop_button)
+
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(control_layout)
+        main_layout.addLayout(button_layout)
+        main_layout.addWidget(self.image_display_label, 1) # ให้ส่วนแสดงภาพขยายได้
+        main_layout.addWidget(self.status_label)
+
+        central_widget = QWidget()
+        central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
+
+        # --- เชื่อมต่อ Signals กับ Slots ---
+        self.model_browse_button.clicked.connect(self.browse_model_file)
+        self.source_browse_button.clicked.connect(self.browse_source_file)
+        self.thresh_slider.valueChanged.connect(self.update_threshold)
+        self.start_button.clicked.connect(self.start_detection)
+        self.stop_button.clicked.connect(self.stop_detection)
+
+    def browse_model_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select YOLO Model", "", "PyTorch Model (*.pt)")
+        if file_path:
+            self.model_path_input.setText(file_path)
+
+    def browse_source_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Source File", "", "Video/Image Files (*.mp4 *.avi *.jpg *.png)")
+        if file_path:
+            self.source_path_input.setText(file_path)
+            
+    def update_threshold(self, value):
+        thresh_float = value / 100.0
+        self.thresh_value_label.setText(f"{thresh_float:.2f}")
+        if self.worker:
+            self.worker.threshold = thresh_float
+
+    def start_detection(self):
+        model_path = self.model_path_input.text()
+        source = self.source_path_input.text()
+        threshold = self.thresh_slider.value() / 100.0
+
+        if not os.path.exists(model_path):
+            QMessageBox.critical(self, "Error", "Model file not found!")
+            return
+
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+        # สร้างและเริ่ม Worker Thread
+        self.worker = Worker(model_path, source, threshold)
+        self.worker.image_update.connect(self.update_image)
+        self.worker.status_update.connect(self.update_status)
+        self.worker.finished.connect(self.detection_finished)
+        self.worker.start()
+
+    def stop_detection(self):
+        if self.worker:
+            self.worker.stop()
+        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(True)
+
+    def detection_finished(self):
+        self.status_label.setText("Finished.")
+        self.image_display_label.setText("Processing finished. Press 'Start' to begin again.")
+        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(True)
+
+    def update_image(self, pixmap):
+        self.image_display_label.setPixmap(pixmap.scaled(
+            self.image_display_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+
+    def update_status(self, message):
+        self.status_label.setText(message)
+
+    def closeEvent(self, event):
+        """ฟังก์ชันนี้จะถูกเรียกเมื่อปิดหน้าต่าง"""
+        # บันทึกค่า config ล่าสุด
+        self.config['model_path'] = self.model_path_input.text()
+        self.config['source_path'] = self.source_path_input.text()
+        self.config['threshold'] = self.thresh_slider.value() / 100.0
+        save_config(self.config)
+        
+        # หยุด thread ถ้ายังทำงานอยู่
+        self.stop_detection()
+        super().closeEvent(event)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())

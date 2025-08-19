@@ -1,0 +1,36 @@
+
+Prepare
+python train_val_split.py --datapath="D:\aiT\custom_data" --train_pct=.8
+python.exe dataYaml.py
+
+-------------------------------------------
+Tain
+
+
+yolo detect train data=data.yaml model=yolo11s.pt epochs=60 imgsz=640
+yolo detect train data=data.yaml model=yolo11n.pt epochs=60 imgsz=640
+yolo detect train data=data.yaml model=yolo11m.pt epochs=60 imgsz=640
+yolo detect train data=data.yaml model=yolo11l.pt epochs=60 imgsz=640
+yolo detect train data=data.yaml model=yolo11x.pt epochs=60 imgsz=640
+-----------------------
+
+see
+python yolo_detect.py --model=D:\aiT\runs\detect\train\weights\best.pt --source=usb1  
+
+# Run on USB webacm
+
+
+
+
+
+
+python yolo_detect.py --model=yolo11n.pt --source=usb1
+python yolo_detect.py --model=yolo11s.pt --source=test_vid.mp4 resolution=1280x720  # Run on test_vid.mp4 video file at 1280x720 resolution
+
+
+python yolo_detect.py --model=D:\aiT\runs\detect\train2\weights\best.pt --source=usb1
+
+
+
+conda activate yolo11-env
+

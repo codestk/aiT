@@ -1,0 +1,8 @@
+path: D:\aiT\data
+train: D:\aiT\data\train\images
+val: D:\aiT\data\validation\images
+nc: 3
+names:
+- Rice weevil
+- paddy
+- worm
