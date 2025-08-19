@@ -1,3 +1,5 @@
 outputs/
+data/
+run/
  *.pt
  *.mp4
