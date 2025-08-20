@@ -1,8 +1,8 @@
 {
     "model_path": "D:/aiT/runs/detect/train/weights/best.pt",
-    "source_path": "1",
-    "threshold": 0.62,
-    "autosave": false,
+    "source_path": "D:/aiT/Test/DJI_20250818175227_0012_D_2.mp4",
+    "threshold": 0.64,
+    "autosave": true,
     "fps_index": 7,
     "save_original": false
 }

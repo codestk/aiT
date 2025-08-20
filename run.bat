@@ -23,7 +23,10 @@ echo.
 timeout /t 2 > nul
 
 echo [ขั้นตอนที่ 3/4] กำลังเริ่มการฝึกสอนโมเดล YOLOv8m...
-yolo detect train data=data.yaml model=yolo11x.pt epochs=60 imgsz=640
+rem yolo detect train data=data.yaml model=yolo11m.pt epochs=60 imgsz=640
+rem yolo detect train data=data.yaml model=yolov8s.pt epochs=100 imgsz=640
+yolo detect train data=data.yaml model=yolov8s.pt epochs=150 imgsz=1280 batch=8 close_mosaic=10
+
 echo Model training complete.
 echo
 timeout /t 2 > nul
