@@ -1,5 +1,5 @@
 path: D:\aiT\data
 train: D:\aiT\data\train\images
 val: D:\aiT\data\validation\images
-nc: 3
-names: ["Rice_Weevil", "paddy", "worm"]
+nc: 6
+names: ["Rice weevil", "Rice_Weevil", "WatermelonSeeds", "paddy", "wood", "worm"]

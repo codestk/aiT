@@ -39,15 +39,16 @@ class Worker(QThread):
     status_update = pyqtSignal(str)
     finished = pyqtSignal()
 
-    # MODIFIED: เพิ่ม target_fps และ beep_enabled
-    def __init__(self, model_path, source, initial_thresh, is_image_source, autosave_enabled, beep_enabled, target_fps):
+    # MODIFIED: เพิ่ม beep_enabled
+    def __init__(self, model_path, source, initial_thresh, is_image_source, autosave_enabled, target_fps, save_original_enabled, beep_enabled):
         super().__init__()
         self.model_path = model_path
         self.source = source
         self.threshold = initial_thresh
         self.is_image_source = is_image_source
         self.autosave_enabled = autosave_enabled
-        self.beep_enabled = beep_enabled
+        self.save_original_enabled = save_original_enabled
+        self.beep_enabled = beep_enabled # ADDED
         self.target_fps = target_fps
         self._is_running = True
         self.video_writer = None
@@ -55,9 +56,9 @@ class Worker(QThread):
         self.recording_request = None
         self.is_paused = False
         
+        self.session_timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.detection_summary = {}
         
-        # ADDED: สำหรับคำนวณ FPS
         self.fps_buffer = []
         self.avg_fps = 0
 
@@ -83,7 +84,7 @@ class Worker(QThread):
     def play_beep(self):
         """Plays a beep sound if enabled and on Windows."""
         if self.beep_enabled and winsound:
-            winsound.Beep(800, 100)
+            winsound.Beep(800, 100) # Frequency = 800 Hz, Duration = 100 ms
 
     def process_single_image(self, model, labels):
         frame = cv2.imread(self.source)
@@ -91,6 +92,7 @@ class Worker(QThread):
             raise IOError(f"Cannot read image file: {self.source}")
         
         original_frame = frame.copy()
+        detected_frame = frame.copy()
         object_found = False
 
         results = model(frame, verbose=False)
@@ -104,30 +106,22 @@ class Worker(QThread):
                 xmin, ymin, xmax, ymax = xyxy
                 classidx = int(detections[i].cls.item())
                 classname = labels[classidx]
-                
                 self.detection_summary[classname] = self.detection_summary.get(classname, 0) + 1
-                
                 label = f'{classname}: {int(conf*100)}%'
-                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                cv2.putText(frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (66, 135, 245), 2)
+                cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (66, 135, 245), 2)
 
         if object_found:
             self.play_beep()
             if self.autosave_enabled:
-                base, ext = os.path.splitext(self.source)
-                output_path_detected = os.path.join('outputs', f"{os.path.basename(base)}_detected{ext}")
-                output_path_original = os.path.join('outputs', f"{os.path.basename(base)}_original{ext}")
-                os.makedirs('outputs', exist_ok=True)
-                
-                cv2.imwrite(output_path_detected, frame)
-                cv2.imwrite(output_path_original, original_frame)
-                self.status_update.emit(f"Detection saved to outputs folder")
+                self.save_detection_images(original_frame, detected_frame, is_single_image=True)
+                self.status_update.emit(f"Detection saved.")
             else:
                 self.status_update.emit("Object detected (Auto-save is off).")
         else:
             self.status_update.emit("No objects detected in the image.")
 
-        self.display_frame(frame)
+        self.display_frame(detected_frame)
 
     def process_video_stream(self, model, labels):
         try:
@@ -154,9 +148,10 @@ class Worker(QThread):
                 break 
 
             original_frame = frame.copy()
+            detected_frame = frame.copy()
             object_found_in_frame = False
 
-            self.handle_recording_request(frame)
+            self.handle_recording_request(detected_frame)
 
             results = model(frame, verbose=False)
             detections = results[0].boxes
@@ -171,42 +166,37 @@ class Worker(QThread):
                     xmin, ymin, xmax, ymax = xyxy
                     classidx = int(detections[i].cls.item())
                     classname = labels[classidx]
-
                     self.detection_summary[classname] = self.detection_summary.get(classname, 0) + 1
-                    
                     label = f'{classname}: {int(conf*100)}%'
-                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                    cv2.putText(frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (15, 52, 112), 2)
+                    cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (47, 15, 112), 2)
             
             if object_found_in_frame:
                 self.play_beep()
                 if self.autosave_enabled:
-                    self.save_detection_images(original_frame, frame)
+                    self.save_detection_images(original_frame, detected_frame)
 
-            cv2.putText(frame, f'Objects: {object_count}', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
-            
-            # ADDED: วาด FPS ลงบนหน้าจอ
-            cv2.putText(frame, f'FPS: {self.avg_fps:.2f}', (frame.shape[1] - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.putText(detected_frame, f'Objects: {object_count}', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+            cv2.putText(detected_frame, f'FPS: {self.avg_fps:.2f}', (detected_frame.shape[1] - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
             if self.is_recording:
-                cv2.circle(frame, (frame.shape[1] - 30, 80), 10, (0, 0, 255), -1)
-                cv2.putText(frame, 'REC', (frame.shape[1] - 80, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.circle(detected_frame, (detected_frame.shape[1] - 30, 80), 10, (0, 0, 255), -1)
+                cv2.putText(detected_frame, 'REC', (detected_frame.shape[1] - 80, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             if self.is_recording and self.video_writer is not None:
-                self.video_writer.write(frame)
+                self.video_writer.write(detected_frame)
 
-            self.display_frame(frame)
+            self.display_frame(detected_frame)
             
             proc_time = time.time() - start_time
             delay = max(0, target_delay - proc_time)
             time.sleep(delay)
 
-            # ADDED: คำนวณและอัปเดตค่า FPS เฉลี่ย
             end_time = time.time()
             if (end_time - start_time) > 0:
                 actual_fps = 1 / (end_time - start_time)
                 self.fps_buffer.append(actual_fps)
-                if len(self.fps_buffer) > 30: # คำนวณเฉลี่ยจาก 30 เฟรมล่าสุด
+                if len(self.fps_buffer) > 30:
                     self.fps_buffer.pop(0)
                 self.avg_fps = sum(self.fps_buffer) / len(self.fps_buffer)
 
@@ -226,16 +216,17 @@ class Worker(QThread):
     def set_pause_state(self, paused: bool):
         self.is_paused = paused
 
-    def save_detection_images(self, original_frame, detected_frame):
-        output_dir = 'outputs/detections'
+    def save_detection_images(self, original_frame, detected_frame, is_single_image=False):
+        output_dir = os.path.join('outputs', 'detections', self.session_timestamp)
         os.makedirs(output_dir, exist_ok=True)
         timestamp = int(time.time() * 1000)
         
-        original_path = os.path.join(output_dir, f"detection_{timestamp}_original.png")
-        detected_path = os.path.join(output_dir, f"detection_{timestamp}_detected.png")
-        
-        cv2.imwrite(original_path, original_frame)
+        detected_path = os.path.join(output_dir, f"detected_{timestamp}.png")
         cv2.imwrite(detected_path, detected_frame)
+        
+        if self.save_original_enabled:
+            original_path = os.path.join(output_dir, f"detection_{timestamp}_original.png")
+            cv2.imwrite(original_path, original_frame)
 
     def set_recording_state(self, state: bool):
         self.recording_request = state
@@ -293,17 +284,20 @@ class MainWindow(QMainWindow):
         
         self.autosave_checkbox = QCheckBox("Auto-save Detections")
         self.autosave_checkbox.setChecked(self.config.get("autosave", False))
-
+        
+        self.save_original_checkbox = QCheckBox("Save Original Frame")
+        self.save_original_checkbox.setChecked(self.config.get("save_original", True))
+        
+        # ADDED: Checkbox for beep sound
         self.beep_checkbox = QCheckBox("Beep on Detection")
         self.beep_checkbox.setChecked(self.config.get("beep", False))
-        if not winsound:
+        if not winsound: # Disable if winsound is not available
             self.beep_checkbox.setEnabled(False)
             self.beep_checkbox.setToolTip("Only available on Windows")
-            
-        # ADDED: Processing Rate ComboBox
+
         self.fps_label = QLabel("Processing Rate:")
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["Full Speed", "30 FPS", "20 FPS", "15 FPS", "10 FPS", "5 FPS"])
+        self.fps_combo.addItems(["Full Speed","30 FPS", "25 FPS" ,"20 FPS", "15 FPS", "10 FPS", "5 FPS", "2 FPS", "1 FPS"])
         self.fps_combo.setCurrentIndex(self.config.get("fps_index", 0))
 
         self.start_button = QPushButton("Start Detection")
@@ -334,9 +328,10 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.thresh_slider, 2, 1)
         control_layout.addWidget(self.thresh_value_label, 2, 2)
         control_layout.addWidget(self.autosave_checkbox, 2, 3)
-        control_layout.addWidget(self.beep_checkbox, 3, 0)
-        control_layout.addWidget(self.fps_label, 3, 1) # ADDED
-        control_layout.addWidget(self.fps_combo, 3, 2) # ADDED
+        control_layout.addWidget(self.fps_label, 3, 0)
+        control_layout.addWidget(self.fps_combo, 3, 1)
+        control_layout.addWidget(self.save_original_checkbox, 3, 2)
+        control_layout.addWidget(self.beep_checkbox, 3, 3)
         
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.start_button)
@@ -389,12 +384,12 @@ class MainWindow(QMainWindow):
         source = self.source_path_input.text()
         threshold = self.thresh_slider.value() / 100.0
         autosave_enabled = self.autosave_checkbox.isChecked()
+        save_original_enabled = self.save_original_checkbox.isChecked()
         beep_enabled = self.beep_checkbox.isChecked()
         
-        # ADDED: Get target FPS from ComboBox
         fps_text = self.fps_combo.currentText()
         if fps_text == "Full Speed":
-            target_fps = 0 # 0 means no delay
+            target_fps = 0
         else:
             target_fps = int(fps_text.split(" ")[0])
 
@@ -412,8 +407,8 @@ class MainWindow(QMainWindow):
             self.capture_button.setEnabled(True)
             self.record_button.setEnabled(True)
         
-        # MODIFIED: Pass target_fps and beep_enabled to worker
-        self.worker = Worker(model_path, source, threshold, is_image, autosave_enabled, beep_enabled, target_fps)
+        # MODIFIED: Pass beep_enabled to worker
+        self.worker = Worker(model_path, source, threshold, is_image, autosave_enabled, target_fps, save_original_enabled, beep_enabled)
         self.worker.image_update.connect(self.update_image)
         self.worker.status_update.connect(self.update_status)
         self.worker.finished.connect(self.detection_finished)
@@ -509,8 +504,9 @@ class MainWindow(QMainWindow):
         self.config['source_path'] = self.source_path_input.text()
         self.config['threshold'] = self.thresh_slider.value() / 100.0
         self.config['autosave'] = self.autosave_checkbox.isChecked()
+        self.config['fps_index'] = self.fps_combo.currentIndex()
+        self.config['save_original'] = self.save_original_checkbox.isChecked()
         self.config['beep'] = self.beep_checkbox.isChecked()
-        self.config['fps_index'] = self.fps_combo.currentIndex() # ADDED
         save_config(self.config)
         self.stop_detection()
         super().closeEvent(event)
