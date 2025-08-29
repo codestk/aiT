@@ -1,6 +1,8 @@
+Butterfly
 Rice weevil
 Rice_Weevil
 WatermelonSeeds
 paddy
+rock
 wood
 worm

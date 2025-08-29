@@ -2,26 +2,34 @@
   "categories": [
     {
       "id": 0,
-      "name": "Rice weevil"
+      "name": "Butterfly"
     },
     {
       "id": 1,
-      "name": "Rice_Weevil"
+      "name": "Rice weevil"
     },
     {
       "id": 2,
-      "name": "WatermelonSeeds"
+      "name": "Rice_Weevil"
     },
     {
       "id": 3,
-      "name": "paddy"
+      "name": "WatermelonSeeds"
     },
     {
       "id": 4,
-      "name": "wood"
+      "name": "paddy"
     },
     {
       "id": 5,
+      "name": "rock"
+    },
+    {
+      "id": 6,
+      "name": "wood"
+    },
+    {
+      "id": 7,
       "name": "worm"
     }
   ],

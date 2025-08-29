@@ -1,9 +1,15 @@
 {
     "model_path": "D:/aiT/runs/detect/train/weights/best.pt",
-    "source_path": "D:/Lab/camera/test/DJI_20250823131455_0046_D.MP4",
-    "threshold": 0.45,
+    "source_path": "1",
+    "threshold": 0.33,
     "autosave": true,
-    "fps_index": 4,
+    "fps_index": 1,
     "save_original": true,
-    "beep": true
+    "beep": true,
+    "roi": [
+        80,
+        155,
+        331,
+        227
+    ]
 }
