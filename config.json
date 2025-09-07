@@ -1,18 +1,18 @@
 {
     "model_path": "D:/aiT/runs/detect/train/weights/best.pt",
     "source_path": "1",
-    "threshold": 0.33,
+    "threshold": 0.28,
     "autosave": true,
     "fps_index": 1,
-    "save_original": true,
+    "save_original": false,
     "beep": true,
     "roi": [
-        80,
-        155,
-        331,
-        227
+        685,
+        251,
+        1322,
+        696
     ],
-    "resolution_index": 3,
+    "resolution_index": 2,
     "low_latency": false,
     "codec": "XVID"
 }
