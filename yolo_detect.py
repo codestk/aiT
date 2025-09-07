@@ -1,12 +1,27 @@
-# -*- coding: utf-8 -*-
+# How to force MJPG on your USB camera in this GUI
+# -------------------------------------------------
+# This version adds a "Codec" dropdown (Auto / MJPG / YUY2 / H264) and applies the
+# chosen FOURCC to the camera when opening it (DSHOW→MSMF→ANY fallback). It also
+# logs the resulting FOURCC actually set by the driver, along with FPS and
+# resolution, so you can confirm MJPG is active.
 #
-# YOLO Rice Sorting GUI Application
-# This script creates a graphical user interface (GUI) for real-time object detection using the YOLO model.
-# It can be used to detect and sort objects like good and bad rice grains from a camera stream or video file.
+# Notes (Windows):
+# - Many UVC cameras only expose certain resolution+FPS+codec combinations.
+#   If setting MJPG fails at 1920×1080@60, try 1280×720 or 1920×1080@30.
+# - With MSMF some devices ignore CAP_PROP_FOURCC; DSHOW often honors it better.
+# - Set resolution before FOURCC (some drivers require that ordering).
+# - After setting, always read back CAP_PROP_FOURCC to verify.
 #
-# แอปพลิเคชัน GUI สำหรับคัดแยกเมล็ดข้าวด้วย YOLO
-# สคริปต์นี้สร้างหน้าต่างโปรแกรม (GUI) สำหรับตรวจจับวัตถุแบบเรียลไทม์โดยใช้โมเดล YOLO
-# สามารถนำไปใช้ตรวจจับและคัดแยกวัตถุต่างๆ เช่น เมล็ดข้าวดีและข้าวเสีย จากกล้องหรือไฟล์วิดีโอ
+# ✅ What’s added:
+# 1) GUI: Codec dropdown (self.codec_combo) with more options.
+# 2) Save/restore codec to config.json
+# 3) Camera open: sets resolution → FOURCC → (optional) FPS, then logs actual values
+# 4) Helper to convert FOURCC int→string for readable status
+# 5) MODIFIED: Camera backend preference changed to DSHOW -> MSMF -> ANY.
+# 6) MODIFIED: Desired height is now hardcoded to 120px.
+# 7) MODIFIED: Added more codec options to the dropdown.
+# 8) MODIFIED: Improved the FOURCC to string conversion to be more robust.
+
 
 import sys
 import os
@@ -14,29 +29,98 @@ import json
 import time
 from datetime import datetime
 import threading
+import struct # For robust FOURCC conversion
 
-# Import winsound for beep sound on Windows.
-# The try-except block ensures the application runs on other operating systems.
 try:
     import winsound
 except ImportError:
     winsound = None
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-                             QSlider, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QLineEdit, QFileDialog, QMessageBox, QCheckBox, QComboBox)
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QSlider, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLineEdit, QFileDialog, QMessageBox, QCheckBox, QComboBox
+)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QRect, QObject
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen
 import cv2
 from ultralytics import YOLO
+import torch
+import numpy as np
 
-# --- Configuration File Handling ---
-# ส่วนจัดการไฟล์ Config
-# The configuration file stores user settings like model path and source path.
+# ---- Perf tweaks ----
+try:
+    torch.backends.cudnn.benchmark = True
+except Exception:
+    pass
+try:
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
+
+MODEL_CACHE = {}
+
+# MODIFIED: Added more common codecs
+CODEC_MAP = {
+    "Auto": None,
+    "MJPG": "MJPG",
+    "YUY2": "YUY2",
+    "H264": "H264",
+    "DIVX": "DIVX",
+    "XVID": "XVID",
+    "MP4V": "MP4V",
+    "I420": "I420", # YUV420 format
+}
+
+# MODIFIED: Made this function more robust to handle non-standard values
+def int_fourcc_to_str(val:int) -> str:
+    """Converts a FOURCC integer code to a readable string using struct, handles errors."""
+    if not isinstance(val, (int, float)) or int(val) == 0:
+        return "----"
+    try:
+        val_int = int(val)
+        # Handle potential negative values from some drivers by converting to unsigned 32-bit
+        if val_int < 0:
+            val_int += (1 << 32)
+        # Pack the integer into 4 bytes (little-endian) and decode as ASCII.
+        # 'replace' will insert a placeholder for any byte that is not valid ASCII.
+        return struct.pack('<I', val_int).decode('ascii', errors='replace').strip()
+    except (struct.error, OverflowError):
+        # If the int is too large or causes a packing error, show its raw hex value.
+        return f"Raw({hex(int(val))})"
+
+
+def load_yolo_model_cached(model_path):
+    print(f"Entering load_yolo_model_cached")
+    if model_path in MODEL_CACHE:
+        return MODEL_CACHE[model_path]
+    model = YOLO(model_path)
+    if torch.cuda.is_available():
+        try:
+            model.to('cuda:0')
+            try:
+                model.fuse()
+            except Exception:
+                pass
+            try:
+                model.model.half()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    try:
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        _ = model(dummy, verbose=False, device='cuda:0' if torch.cuda.is_available() else 'cpu', half=True if torch.cuda.is_available() else False)
+    except Exception:
+        pass
+    MODEL_CACHE[model_path] = model
+    return model
+
 CONFIG_FILE = 'config.json'
 
 def load_config():
-    """Loads settings from the configuration file."""
+    print(f"Entering load_config")
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
@@ -46,504 +130,354 @@ def load_config():
     return {}
 
 def save_config(data):
-    """Saves current settings to the configuration file."""
+    print(f"Entering save_config")
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
-# --- Custom QLabel for ROI Selection ---
-# คลาส QLabel แบบกำหนดเองสำหรับเลือก ROI
-# This class handles mouse events to allow the user to draw a rectangle.
 class ROISelectorLabel(QLabel):
     roi_selected = pyqtSignal(QRect)
-
     def __init__(self, parent=None):
+        #print(f"Entering ROISelectorLabel.__init__")
         super().__init__(parent)
         self.is_selecting = False
-        self.start_point = QPoint()
-        self.end_point = QPoint()
-        self.setMouseTracking(True)
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-
+        self.start_point = QPoint(); self.end_point = QPoint()
+        self.setMouseTracking(True); self.setCursor(Qt.CursorShape.ArrowCursor)
     def start_selection(self):
-        self.is_selecting = True
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        self.update()
-
-    def mousePressEvent(self, event):
-        if self.is_selecting and event.button() == Qt.MouseButton.LeftButton:
-            self.start_point = event.pos()
-            self.end_point = self.start_point
+        #print(f"Entering ROISelectorLabel.start_selection")
+        self.is_selecting = True; self.setCursor(Qt.CursorShape.CrossCursor); self.update()
+    def mousePressEvent(self, e):
+        #print(f"Entering ROISelectorLabel.mousePressEvent")
+        if self.is_selecting and e.button() == Qt.MouseButton.LeftButton:
+            self.start_point = e.pos(); self.end_point = self.start_point; self.update()
+        super().mousePressEvent(e)
+    def mouseMoveEvent(self, e):
+        #print(f"Entering ROISelectorLabel.mouseMoveEvent")
+        if self.is_selecting and e.buttons() == Qt.MouseButton.LeftButton:
+            self.end_point = e.pos(); self.update()
+        super().mouseMoveEvent(e)
+    def mouseReleaseEvent(self, e):
+        #print(f"Entering ROISelectorLabel.mouseReleaseEvent")
+        if self.is_selecting and e.button() == Qt.MouseButton.LeftButton:
+            self.is_selecting = False; self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.roi_selected.emit(QRect(self.start_point, self.end_point).normalized())
             self.update()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self.is_selecting and event.buttons() == Qt.MouseButton.LeftButton:
-            self.end_point = event.pos()
-            self.update()
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self.is_selecting and event.button() == Qt.MouseButton.LeftButton:
-            self.is_selecting = False
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            selection_rect = QRect(self.start_point, self.end_point).normalized()
-            self.roi_selected.emit(selection_rect)
-            self.update()
-        super().mouseReleaseEvent(event)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        
-        # Draw ROI selection if active
+        super().mouseReleaseEvent(e)
+    def paintEvent(self, e):
+        #print(f"Entering ROISelectorLabel.paintEvent")
+        super().paintEvent(e)
+        p = QPainter(self)
         if self.is_selecting:
-            pen = QPen(Qt.GlobalColor.blue, 2, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            painter.drawRect(QRect(self.start_point, self.end_point).normalized())
-            
-        # Draw center guide lines
-        pen_guide = QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.SolidLine)
-        painter.setPen(pen_guide)
-        
-        # Get the size of the displayed pixmap
-        pixmap = self.pixmap()
-        if pixmap and not pixmap.isNull():
-            # Calculate the center of the scaled pixmap within the label
-            label_size = self.size()
-            scaled_pixmap_size = pixmap.size().scaled(label_size, Qt.AspectRatioMode.KeepAspectRatio)
-            offset_x = (label_size.width() - scaled_pixmap_size.width()) / 2
-            offset_y = (label_size.height() - scaled_pixmap_size.height()) / 2
-            
-            center_x = int(offset_x + scaled_pixmap_size.width() / 2)
-            center_y = int(offset_y + scaled_pixmap_size.height() / 2)
-            
-            # Draw horizontal line
-            painter.drawLine(int(offset_x), center_y, int(offset_x + scaled_pixmap_size.width()), center_y)
-            # Draw vertical line
-            painter.drawLine(center_x, int(offset_y), center_x, int(offset_y + scaled_pixmap_size.height()))
-        
-
+            p.setPen(QPen(Qt.GlobalColor.blue, 2, Qt.PenStyle.DashLine))
+            p.drawRect(QRect(self.start_point, self.end_point).normalized())
+        p.setPen(QPen(Qt.GlobalColor.red, 1))
+        pm = self.pixmap()
+        if pm and not pm.isNull():
+            L = self.size(); S = pm.size().scaled(L, Qt.AspectRatioMode.KeepAspectRatio)
+            ox = (L.width()-S.width())/2; oy=(L.height()-S.height())/2
+            cx = int(ox+S.width()/2); cy=int(oy+S.height()/2); arm=40
+            p.drawLine(cx-arm, cy, cx+arm, cy); p.drawLine(cx, cy-arm, cx, cy+arm)
     def clear_roi(self):
-        self.is_selecting = False
-        self.update()
+        print(f"Entering ROISelectorLabel.clear_roi")
+        self.is_selecting=False; self.update()
 
-# --- Worker Thread for YOLO Processing ---
-# Worker Thread สำหรับการประมวลผล YOLO
 class Worker(QObject):
     image_update = pyqtSignal(QPixmap)
     status_update = pyqtSignal(str)
     finished = pyqtSignal()
-    
-    def __init__(self, model_path, source, initial_thresh, is_image_source, autosave_enabled, target_fps, save_original_enabled, beep_enabled, roi=None):
+    def __init__(self, model_path, source, initial_thresh, is_image_source,
+                 autosave_enabled, target_fps, save_original_enabled, beep_enabled,
+                 roi=None, desired_resolution=None, is_webcam_source=False,
+                 low_latency_mode=False, codec_choice: str|None=None):
+        print(f"Entering Worker.__init__")
         super().__init__()
-        self.model_path = model_path
-        self.source = source
-        self.threshold = initial_thresh
-        self.is_image_source = is_image_source
-        self.autosave_enabled = autosave_enabled
-        self.save_original_enabled = save_original_enabled
-        self.beep_enabled = beep_enabled
-        self.target_fps = target_fps
-        self.roi = roi
-        self._is_running = True
-        self.video_writer = None
-        self.is_recording = False
-        self.recording_request = None
-        self.is_paused = False
-        
-        self.session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.detection_summary = {}
-        
-        self.fps_buffer = []
-        self.avg_fps = 0
-
-        self.latest_frame = None
-        self.lock = threading.Lock()
-
+        self.model_path=model_path; self.source=source; self.threshold=initial_thresh
+        self.is_image_source=is_image_source; self.autosave_enabled=autosave_enabled
+        self.save_original_enabled=save_original_enabled; self.beep_enabled=beep_enabled
+        self.target_fps=target_fps; self.roi=roi; self.desired_resolution=desired_resolution
+        self.is_webcam_source=is_webcam_source; self.low_latency_mode=low_latency_mode
+        self.codec_choice = codec_choice  # 'MJPG'/'YUY2'/'H264'/None
+        self._is_running=True; self.video_writer=None; self.is_recording=False
+        self.recording_request=None; self.is_paused=False
+        self.session_timestamp=datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.detection_summary={}; self.fps_buffer=[]; self.avg_fps=0
+        self.total_objects_detected = 0  # Cumulative counter for all objects
+        self.latest_frame=None; self.lock=threading.Lock()
     def run(self):
-        """Main loop for processing the video or image source."""
+        print(f"Entering Worker.run")
         try:
             self.status_update.emit("Loading YOLO model...")
-            model = YOLO(self.model_path)
-            labels = model.names
+            model = load_yolo_model_cached(self.model_path); labels = model.names
             self.status_update.emit(f"Model loaded. Opening source: {self.source}")
-
-            if self.is_image_source:
-                self.process_single_image(model, labels)
-            else:
-                self.process_video_stream(model, labels)
-                
+            if torch.cuda.is_available():
+                try:
+                    model.to('cuda:0')
+                    try: model.fuse()
+                    except Exception: pass
+                    try: model.model.half()
+                    except Exception: pass
+                except Exception: pass
+            if self.is_image_source: self.process_single_image(model, labels)
+            else: self.process_video_stream(model, labels)
         except Exception as e:
             self.status_update.emit(f"Error: {e}")
         finally:
-            if self.is_recording:
-                self.stop_recording()
+            if self.is_recording: self.stop_recording()
             self.finished.emit()
-
     def play_beep(self):
-        """Plays a beep sound if enabled and on Windows."""
-        if self.beep_enabled and winsound:
-            winsound.Beep(800, 100) # Frequency = 800 Hz, Duration = 100 ms
+        #print(f"Entering Worker.play_beep")
+        if self.beep_enabled and winsound: winsound.Beep(800,100)
+    def _apply_camera_settings(self, cap):
+        print(f"Entering Worker._apply_camera_settings")
+        start_time = time.time()
 
-    def process_single_image(self, model, labels):
-        """Processes a single image file."""
-        frame = cv2.imread(self.source)
-        if frame is None:
-            raise IOError(f"Cannot read image file: {self.source}")
-        
-        with self.lock:
-            self.latest_frame = frame.copy()
+        # Resolution first
+        if self.is_webcam_source and self.desired_resolution:
+            try:
+                w,h = self.desired_resolution
+                print(f"Attempting to set resolution to {w}x{h}")
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+                print(f"Set resolution took: {time.time() - start_time:.4f} seconds")
+            except Exception as e:
+                print(f"Error setting resolution: {e}")
+            start_time = time.time() # Reset timer for next operation
 
-        detected_frame = frame.copy()
-        
-        if self.roi and all(v >= 0 for v in self.roi):
-            x, y, w, h = self.roi
-            x = max(0, x)
-            y = max(0, y)
-            w = min(w, frame.shape[1] - x)
-            h = min(h, frame.shape[0] - y)
-            cropped_frame = frame[y:y+h, x:x+w]
-        else:
-            cropped_frame = frame
-        
-        object_found = False
-        results = model(cropped_frame, verbose=False)
-        detections = results[0].boxes
-        
-        for i in range(len(detections)):
-            conf = detections[i].conf.item()
-            if conf > self.threshold:
-                object_found = True
-                xyxy = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
-                xmin, ymin, xmax, ymax = xyxy
-                classidx = int(detections[i].cls.item())
-                classname = labels[classidx]
-                self.detection_summary[classname] = self.detection_summary.get(classname, 0) + 1
-                label = f'{classname}: {int(conf*100)}%'
-                
-                # Offset bounding box coordinates to match the full frame if ROI is used
-                if self.roi and all(v >= 0 for v in self.roi):
-                    roi_x, roi_y, _, _ = self.roi
-                    xmin += roi_x
-                    ymin += roi_y
-                    xmax += roi_x
-                    ymax += roi_y
-                
-                # Draw the detection box in green
-                cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
-        # Draw the blue ROI box after all detections, so it's on top.
-        if self.roi and all(v >= 0 for v in self.roi):
-            x, y, w, h = self.roi
-            cv2.rectangle(detected_frame, (x, y), (x + w, y + h), (255, 0, 0), 3)
-
-        if object_found:
-            self.play_beep()
-            if self.autosave_enabled:
-                self.save_detection_images(frame, detected_frame, is_single_image=True)
-                self.status_update.emit(f"Detection saved.")
-            else:
-                self.status_update.emit("Object detected (Auto-save is off).")
-        else:
-            self.status_update.emit("No objects detected in the image.")
-
-        self.display_frame(detected_frame)
-
-    def process_video_stream(self, model, labels):
-        """Processes a video stream from a webcam or video file."""
+        # FOURCC next
         try:
-            source_index = int(self.source)
-            cap = cv2.VideoCapture(source_index)
+            if self.codec_choice:
+                fourcc = cv2.VideoWriter_fourcc(*self.codec_choice)
+                print(f"Attempting to set FOURCC to {self.codec_choice}")
+                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+                print(f"Set FOURCC took: {time.time() - start_time:.4f} seconds")
+        except Exception as e:
+            print(f"Error setting FOURCC: {e}")
+        start_time = time.time() # Reset timer for next operation
+
+        # FPS last
+        try:
+            if self.target_fps>0:
+                print(f"Attempting to set FPS to {self.target_fps}")
+                cap.set(cv2.CAP_PROP_FPS, float(self.target_fps))
+                print(f"Set FPS took: {time.time() - start_time:.4f} seconds")
+        except Exception as e:
+            print(f"Error setting FPS: {e}")
+        start_time = time.time() # Reset timer for next operation
+
+        # report actuals
+        try:
+            rw=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); rh=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            rf=cap.get(cv2.CAP_PROP_FPS); fc=int_fourcc_to_str(int(cap.get(cv2.CAP_PROP_FOURCC)))
+            self.status_update.emit(f"Camera set → {rw}x{rh} @{rf:.1f} FPS, FOURCC={fc}")
+            print(f"Get actuals and emit status took: {time.time() - start_time:.4f} seconds")
+        except Exception as e:
+            print(f"Error getting actual camera settings: {e}")
+    def process_single_image(self, model, labels):
+        print(f"Entering Worker.process_single_image")
+        frame=cv2.imread(self.source)
+        if frame is None: raise IOError(f"Cannot read image file: {self.source}")
+        with self.lock: self.latest_frame=frame.copy()
+        detected_frame=frame.copy()
+        if self.roi and all(v>=0 for v in self.roi):
+            x,y,w,h=self.roi; x=max(0,x); y=max(0,y); w=min(w, frame.shape[1]-x); h=min(h, frame.shape[0]-y)
+            cropped_frame=frame[y:y+h, x:x+w]
+        else:
+            cropped_frame=frame
+        results=model(cropped_frame, verbose=False, device='cuda:0' if torch.cuda.is_available() else 'cpu', half=True if torch.cuda.is_available() else False)
+        detections=results[0].boxes; object_found=False
+        for i in range(len(detections)):
+            conf=detections[i].conf.item()
+            if conf>self.threshold:
+                object_found=True
+                xmin,ymin,xmax,ymax = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
+                cls=int(detections[i].cls.item()); name=labels[cls]; label=f"{name}: {int(conf*100)}%"
+                if self.roi and all(v>=0 for v in self.roi):
+                    rx,ry,_,_=self.roi; xmin+=rx; ymin+=ry; xmax+=rx; ymax+=ry
+                self.detection_summary[name]=self.detection_summary.get(name,0)+1
+                self.total_objects_detected += 1
+                cv2.rectangle(detected_frame,(xmin,ymin),(xmax,ymax),(0,255,0),2)
+                cv2.putText(detected_frame,label,(xmin,ymin-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
+        if self.roi and all(v>=0 for v in self.roi):
+            x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(255,0,0),3)
+        # Count objects in this frame
+        frame_count = sum(1 for i in range(len(detections)) if detections[i].conf.item() > self.threshold)
+        cv2.putText(detected_frame,f'Frame: {frame_count} | Total: {self.total_objects_detected}',(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+        self.status_update.emit("Detection saved." if object_found and self.autosave_enabled else ("Object detected (Auto-save is off)." if object_found else "No objects detected in the image."))
+        cv2.putText(detected_frame,f'Res: {detected_frame.shape[1]}x{detected_frame.shape[0]}',(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,255,255),2)
+        self.display_frame(detected_frame)
+    def process_video_stream(self, model, labels):
+        print(f"Entering Worker.process_video_stream")
+        try:
+            idx=int(self.source)
+            # MODIFIED: Try DSHOW first as requested.
+            cap=cv2.VideoCapture(idx, cv2.CAP_DSHOW); backend='DSHOW'
+            if not cap.isOpened():
+                cap.release(); cap=cv2.VideoCapture(idx, cv2.CAP_MSMF); backend='MSMF'
+            if not cap.isOpened():
+                cap.release(); cap=cv2.VideoCapture(idx); backend='ANY'
+
+            if cap.isOpened():
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception: pass
+                self._apply_camera_settings(cap)
+                self.status_update.emit(f"Webcam opened using backend: {backend}{' (Low Latency)' if self.low_latency_mode else ''}")
         except ValueError:
-            cap = cv2.VideoCapture(self.source)
-        
-        if not cap.isOpened():
-            raise IOError(f"Cannot open source: {self.source}")
-
-        target_delay = 1.0 / self.target_fps if self.target_fps > 0 else 0
-
+            cap=cv2.VideoCapture(self.source)
+        if not cap.isOpened(): raise IOError(f"Cannot open source: {self.source}")
+        target_delay=1.0/self.target_fps if self.target_fps>0 else 0
         self.status_update.emit("Processing...")
         while self._is_running:
-            start_time = time.time()
-
+            t0=time.time()
             if self.is_paused:
-                time.sleep(0.1)
-                continue
-
+                time.sleep(0.1); continue
+            if self.low_latency_mode:
+                try: cap.grab()
+                except Exception: pass
             ret, frame = cap.read()
-            if not ret:
-                break 
-
-            with self.lock:
-                self.latest_frame = frame.copy()
-
-            detected_frame = frame.copy()
-            object_found_in_frame = False
-
+            if not ret: break
+            with self.lock: self.latest_frame=frame.copy()
+            detected_frame=frame.copy(); found=False
             self.handle_recording_request(detected_frame)
-            
-            if self.roi and all(v >= 0 for v in self.roi):
-                x, y, w, h = self.roi
-                x = max(0, x)
-                y = max(0, y)
-                w = min(w, frame.shape[1] - x)
-                h = min(h, frame.shape[0] - y)
-                cropped_frame = frame[y:y+h, x:x+w]
+            if self.roi and all(v>=0 for v in self.roi):
+                x,y,w,h=self.roi; x=max(0,x); y=max(0,y); w=min(w, frame.shape[1]-x); h=min(h, frame.shape[0]-y)
+                cropped=frame[y:y+h, x:x+w]
             else:
-                cropped_frame = frame
-
-            results = model(cropped_frame, verbose=False)
-            detections = results[0].boxes
-            object_count = 0
-            
-            # Offset bounding box coordinates to match the full frame if ROI is used
+                cropped=frame
+            results=model(cropped, verbose=False, device='cuda:0' if torch.cuda.is_available() else 'cpu', half=True if torch.cuda.is_available() else False)
+            detections=results[0].boxes; count=0
             for i in range(len(detections)):
-                conf = detections[i].conf.item()
-                if conf > self.threshold:
-                    object_found_in_frame = True
-                    object_count += 1
-                    xyxy = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
-                    xmin, ymin, xmax, ymax = xyxy
-                    classidx = int(detections[i].cls.item())
-                    classname = labels[classidx]
-                    self.detection_summary[classname] = self.detection_summary.get(classname, 0) + 1
-                    label = f'{classname}: {int(conf*100)}%'
-                    
-                    if self.roi and all(v >= 0 for v in self.roi):
-                        roi_x, roi_y, _, _ = self.roi
-                        xmin += roi_x
-                        ymin += roi_y
-                        xmax += roi_x
-                        ymax += roi_y
-
-                    # Draw the detection box in green
-                    cv2.rectangle(detected_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                    cv2.putText(detected_frame, label, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            if object_found_in_frame:
+                conf=detections[i].conf.item()
+                if conf>self.threshold:
+                    found=True; count+=1
+                    xmin,ymin,xmax,ymax = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
+                    cls=int(detections[i].cls.item()); name=labels[cls]; label=f"{name}: {int(conf*100)}%"
+                    if self.roi and all(v>=0 for v in self.roi):
+                        rx,ry,_,_=self.roi; xmin+=rx; ymin+=ry; xmax+=rx; ymax+=ry
+                    self.detection_summary[name]=self.detection_summary.get(name,0)+1
+                    self.total_objects_detected += 1
+                    cv2.rectangle(detected_frame,(xmin,ymin),(xmax,ymax),(0,255,0),2)
+                    cv2.putText(detected_frame,label,(xmin,ymin-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
+            if found:
                 self.play_beep()
-                if self.autosave_enabled:
-                    self.save_detection_images(frame, detected_frame)
-
-            # Draw the blue ROI box after all detections, so it's on top.
-            if self.roi and all(v >= 0 for v in self.roi):
-                x, y, w, h = self.roi
-                cv2.rectangle(detected_frame, (x, y), (x + w, y + h), (255, 0, 0), 3)
-
-            # Display FPS and object count on the frame
-            cv2.putText(detected_frame, f'Objects: {object_count}', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
-            cv2.putText(detected_frame, f'FPS: {self.avg_fps:.2f}', (detected_frame.shape[1] - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-
-            # Display recording indicator
+                if self.autosave_enabled: self.save_detection_images(frame, detected_frame)
+            if self.roi and all(v>=0 for v in self.roi):
+                x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(255,0,0),3)
+            cv2.putText(detected_frame,f'Frame: {count} | Total: {self.total_objects_detected}',(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+            cv2.putText(detected_frame,f'FPS: {self.avg_fps:.2f}',(detected_frame.shape[1]-150,40),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+            cv2.putText(detected_frame,f'Res: {detected_frame.shape[1]}x{detected_frame.shape[0]}',(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,255,255),2)
             if self.is_recording:
-                cv2.circle(detected_frame, (detected_frame.shape[1] - 30, 80), 10, (0, 0, 255), -1)
-                cv2.putText(detected_frame, 'REC', (detected_frame.shape[1] - 80, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
+                cv2.circle(detected_frame,(detected_frame.shape[1]-30,80),10,(0,0,255),-1)
+                cv2.putText(detected_frame,'REC',(detected_frame.shape[1]-80,85),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
             if self.is_recording and self.video_writer is not None:
                 self.video_writer.write(detected_frame)
-
             self.display_frame(detected_frame)
-            
-            proc_time = time.time() - start_time
-            delay = max(0, target_delay - proc_time)
-            time.sleep(delay)
-
-            end_time = time.time()
-            if (end_time - start_time) > 0:
-                actual_fps = 1 / (end_time - start_time)
-                self.fps_buffer.append(actual_fps)
-                if len(self.fps_buffer) > 30:
-                    self.fps_buffer.pop(0)
-                self.avg_fps = sum(self.fps_buffer) / len(self.fps_buffer)
-
+            proc=time.time()-t0; delay=max(0, target_delay-proc); time.sleep(delay)
+            t1=time.time();
+            if (t1-t0)>0:
+                fps=1/(t1-t0); self.fps_buffer.append(fps)
+                if len(self.fps_buffer)>30: self.fps_buffer.pop(0)
+                self.avg_fps=sum(self.fps_buffer)/len(self.fps_buffer)
         cap.release()
-
     def display_frame(self, frame):
-        """Converts an OpenCV frame to a QPixmap and emits it for display."""
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        self.image_update.emit(pixmap)
-
+        #print(f"Entering Worker.display_frame")
+        rgb=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h,w,ch=rgb.shape; qimg=QImage(rgb.data,w,h,ch*w,QImage.Format.Format_RGB888)
+        self.image_update.emit(QPixmap.fromImage(qimg))
     def stop(self):
-        """Stops the worker thread."""
-        self._is_running = False
-
-    def set_pause_state(self, paused: bool):
-        """Pauses or resumes the video stream."""
-        self.is_paused = paused
-
-    def save_detection_images(self, original_frame, detected_frame, is_single_image=False):
-        """Saves detected frames to the 'outputs/detections' folder."""
-        output_dir = os.path.join('outputs', 'detections', self.session_timestamp)
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = int(time.time() * 1000)
-        
-        detected_path = os.path.join(output_dir, f"detected_{timestamp}.png")
-        cv2.imwrite(detected_path, detected_frame)
-        
+        print(f"Entering Worker.stop")
+        self._is_running=False
+    def set_pause_state(self, paused:bool):
+        print(f"Entering Worker.set_pause_state")
+        self.is_paused=paused
+    def save_detection_images(self, original, detected, is_single_image=False):
+        #print(f"Entering Worker.save_detection_images")
+        out = os.path.join('outputs','detections', self.session_timestamp); os.makedirs(out, exist_ok=True)
+        ts = int(time.time()*1000)
+        cv2.imwrite(os.path.join(out, f"detected_{ts}.png"), detected)
         if self.save_original_enabled:
-            original_path = os.path.join(output_dir, f"detection_{timestamp}_original.png")
-            cv2.imwrite(original_path, original_frame)
-
-    def set_recording_state(self, state: bool):
-        """Sets the recording state request."""
-        self.recording_request = state
-
+            cv2.imwrite(os.path.join(out, f"detection_{ts}_original.png"), original)
+    def set_recording_state(self, state:bool):
+        print(f"Entering Worker.set_recording_state")
+        self.recording_request=state
     def handle_recording_request(self, frame):
-        """Handles starting and stopping of video recording."""
+        #print(f"Entering Worker.handle_recording_request")
         if self.recording_request is not None:
-            if self.recording_request is True and not self.is_recording:
-                self.start_recording(frame)
-            elif self.recording_request is False and self.is_recording:
-                self.stop_recording()
-            self.recording_request = None
-
+            if self.recording_request and not self.is_recording: self.start_recording(frame)
+            elif (not self.recording_request) and self.is_recording: self.stop_recording()
+            self.recording_request=None
     def start_recording(self, frame):
-        """Starts a new video recording session."""
-        output_dir = 'outputs'
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = int(time.time())
-        file_name = f"record_{timestamp}.avi"
-        save_path = os.path.join(output_dir, file_name)
-        h, w, _ = frame.shape
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        self.video_writer = cv2.VideoWriter(save_path, fourcc, 20.0, (w, h))
-        self.is_recording = True
-        self.status_update.emit(f"Recording started, saving to {save_path}")
-
+        print(f"Entering Worker.start_recording")
+        out='outputs'; os.makedirs(out, exist_ok=True)
+        ts=int(time.time()); path=os.path.join(out, f"record_{ts}.avi")
+        h,w,_=frame.shape; fourcc=cv2.VideoWriter_fourcc(*'XVID')
+        self.video_writer=cv2.VideoWriter(path, fourcc, 20.0, (w,h)); self.is_recording=True
+        self.status_update.emit(f"Recording started, saving to {path}")
     def stop_recording(self):
-        """Stops the current video recording."""
+        print(f"Entering Worker.stop_recording")
         if self.video_writer:
-            self.video_writer.release()
-            self.video_writer = None
-        self.is_recording = False
-        self.status_update.emit("Recording stopped.")
-    
-    # NEW: Method to update ROI from the main thread
+            self.video_writer.release(); self.video_writer=None
+        self.is_recording=False; self.status_update.emit("Recording stopped.")
     def update_roi(self, new_roi):
-        self.roi = new_roi
+        print(f"Entering Worker.update_roi")
+        self.roi=new_roi
 
-
-# --- Main GUI Window ---
-# หน้าต่างหลักของโปรแกรม
 class MainWindow(QMainWindow):
     def __init__(self):
+        print(f"Entering MainWindow.__init__")
         super().__init__()
         self.setWindowTitle("YOLO Object Detection GUI")
-        self.setGeometry(100, 100, 1000, 800)
-        self.config = load_config()
-        self.video_thread = QThread() 
-        self.worker = None
-        self.current_pixmap = None
+        self.setGeometry(100,100,1000,800)
+        self.config=load_config(); self.video_thread=QThread(); self.worker=None
+        self.current_pixmap=None; self.roi=self.config.get("roi", None)
+        # Widgets
+        self.model_label=QLabel("YOLO Model Path:"); self.model_path_input=QLineEdit(self.config.get("model_path",""))
+        self.model_browse_button=QPushButton("Browse...")
+        self.source_label=QLabel("Source (File/Webcam Index):"); self.source_path_input=QLineEdit(self.config.get("source_path","0"))
+        self.source_browse_button=QPushButton("Browse File...")
+        self.list_cams_button=QPushButton("List Cameras")
+        self.thresh_label=QLabel("Confidence Threshold:"); self.thresh_slider=QSlider(Qt.Orientation.Horizontal)
+        self.thresh_slider.setRange(0,100); init_t=int(self.config.get("threshold",0.5)*100)
+        self.thresh_slider.setValue(init_t); self.thresh_value_label=QLabel(f"{init_t/100:.2f}")
+        self.autosave_checkbox=QCheckBox("Auto-save Detections"); self.autosave_checkbox.setChecked(self.config.get("autosave",False))
+        self.save_original_checkbox=QCheckBox("Save Original Frame"); self.save_original_checkbox.setChecked(self.config.get("save_original",True))
+        self.beep_checkbox=QCheckBox("Beep on Detection"); self.beep_checkbox.setChecked(self.config.get("beep",False))
+        if not winsound: self.beep_checkbox.setEnabled(False); self.beep_checkbox.setToolTip("Only available on Windows")
+        self.low_latency_checkbox=QCheckBox("Low Latency (optimize camera startup)"); self.low_latency_checkbox.setChecked(self.config.get("low_latency",True))
+        self.fps_label=QLabel("Processing Rate:"); self.fps_combo=QComboBox(); self.fps_combo.addItems(["Full Speed","60 FPS","50 FPS","30 FPS","25 FPS","20 FPS","15 FPS","10 FPS","5 FPS","2 FPS","1 FPS"])
+        self.fps_combo.setCurrentIndex(self.config.get("fps_index",0))
         
-        # MODIFIED: Load ROI from config on startup
-        self.roi = self.config.get("roi", None)
-
-        # --- Create Widgets ---
-        # สร้าง Widgets ต่างๆ
-        self.model_label = QLabel("YOLO Model Path:")
-        self.model_path_input = QLineEdit(self.config.get("model_path", ""))
-        self.model_browse_button = QPushButton("Browse...")
-        
-        self.source_label = QLabel("Source (File/Webcam Index):")
-        self.source_path_input = QLineEdit(self.config.get("source_path", "0"))
-        self.source_browse_button = QPushButton("Browse File...")
-        
-        self.thresh_label = QLabel("Confidence Threshold:")
-        self.thresh_slider = QSlider(Qt.Orientation.Horizontal)
-        self.thresh_slider.setRange(0, 100)
-        initial_thresh = int(self.config.get("threshold", 0.5) * 100)
-        self.thresh_slider.setValue(initial_thresh)
-        self.thresh_value_label = QLabel(f"{initial_thresh/100:.2f}")
-        
-        self.autosave_checkbox = QCheckBox("Auto-save Detections")
-        self.autosave_checkbox.setChecked(self.config.get("autosave", False))
-        
-        self.save_original_checkbox = QCheckBox("Save Original Frame")
-        self.save_original_checkbox.setChecked(self.config.get("save_original", True))
-        
-        # Checkbox for beep sound
-        self.beep_checkbox = QCheckBox("Beep on Detection")
-        self.beep_checkbox.setChecked(self.config.get("beep", False))
-        if not winsound:
-            self.beep_checkbox.setEnabled(False)
-            self.beep_checkbox.setToolTip("Only available on Windows")
-
-        self.fps_label = QLabel("Processing Rate:")
-        self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["Full Speed","30 FPS", "25 FPS" ,"20 FPS", "15 FPS", "10 FPS", "5 FPS", "2 FPS", "1 FPS"])
-        self.fps_combo.setCurrentIndex(self.config.get("fps_index", 0))
-
-        self.start_button = QPushButton("Start Detection")
-        self.stop_button = QPushButton("Stop Detection")
-        self.pause_button = QPushButton("Pause")
-        self.pause_button.setCheckable(True)
-        self.capture_button = QPushButton("Capture Frame")
-        self.record_button = QPushButton("Start Recording")
-        self.record_button.setCheckable(True)
-        
-        # ADDED: ROI buttons
-        self.clear_roi_button = QPushButton("Clear ROI")
-        self.clear_roi_button.setEnabled(False)
-        self.set_roi_button = QPushButton("กำหนดพื้นที่ (ROI)")
-
-        # Initially disable buttons that require a running stream
-        self.stop_button.setEnabled(False)
-        self.pause_button.setEnabled(False)
-        self.capture_button.setEnabled(False)
-        self.record_button.setEnabled(False)
-        
-        # MODIFIED: Use the custom ROILabel class
-        self.image_display_label = ROISelectorLabel("Press 'Start Detection' to begin")
+        self.codec_label=QLabel("Codec:")
+        self.codec_combo=QComboBox(); self.codec_combo.addItems(list(CODEC_MAP.keys()))
+        self.codec_combo.setCurrentText(self.config.get("codec","Auto"))
+        self.resolution_label=QLabel("Resolution:"); self.resolution_combo=QComboBox()
+        self.resolution_options=["Source/Native","2592x1440","2304x1296","1920x1080","1600x900","1280x720","1024x576","960x540","800x450","640x480"]
+        self.resolution_combo.addItems(self.resolution_options)
+        self.resolution_combo.setCurrentIndex(self.config.get("resolution_index",0))
+        self.start_button=QPushButton("Start Detection"); self.stop_button=QPushButton("Stop Detection")
+        self.pause_button=QPushButton("Pause"); self.pause_button.setCheckable(True)
+        self.capture_button=QPushButton("Capture Frame"); self.record_button=QPushButton("Start Recording"); self.record_button.setCheckable(True)
+        self.clear_roi_button=QPushButton("Clear ROI"); self.clear_roi_button.setEnabled(False)
+        self.set_roi_button=QPushButton("กำหนดพื้นที่ (ROI)")
+        self.image_display_label=ROISelectorLabel("Press 'Start Detection' to begin")
         self.image_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_display_label.setStyleSheet("background-color: black; color: white;")
-        self.status_label = QLabel("Ready")
-
-        # --- Layout Arrangement ---
-        # จัด Layout
-        control_layout = QGridLayout()
-        control_layout.addWidget(self.model_label, 0, 0)
-        control_layout.addWidget(self.model_path_input, 0, 1, 1, 2)
-        control_layout.addWidget(self.model_browse_button, 0, 3)
-        control_layout.addWidget(self.source_label, 1, 0)
-        control_layout.addWidget(self.source_path_input, 1, 1, 1, 2)
-        control_layout.addWidget(self.source_browse_button, 1, 3)
-        control_layout.addWidget(self.thresh_label, 2, 0)
-        control_layout.addWidget(self.thresh_slider, 2, 1)
-        control_layout.addWidget(self.thresh_value_label, 2, 2)
-        control_layout.addWidget(self.autosave_checkbox, 2, 3)
-        control_layout.addWidget(self.fps_label, 3, 0)
-        control_layout.addWidget(self.fps_combo, 3, 1)
-        control_layout.addWidget(self.save_original_checkbox, 3, 2)
-        control_layout.addWidget(self.beep_checkbox, 3, 3)
-        
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.stop_button)
-        button_layout.addWidget(self.pause_button)
-        button_layout.addWidget(self.capture_button)
-        button_layout.addWidget(self.record_button)
-        button_layout.addWidget(self.set_roi_button)
-        button_layout.addWidget(self.clear_roi_button)
-        
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(control_layout)
-        main_layout.addLayout(button_layout)
-        main_layout.addWidget(self.image_display_label, 1)
-        main_layout.addWidget(self.status_label)
-        
-        central_widget = QWidget()
-        central_widget.setLayout(main_layout)
-        self.setCentralWidget(central_widget)
-
-        # --- Connect Signals to Slots ---
-        # เชื่อมต่อ Signals กับ Slots
+        self.status_label=QLabel("Ready")
+        # Layout
+        grid=QGridLayout()
+        grid.addWidget(self.model_label,0,0); grid.addWidget(self.model_path_input,0,1,1,2); grid.addWidget(self.model_browse_button,0,3)
+        grid.addWidget(self.source_label,1,0); grid.addWidget(self.source_path_input,1,1,1,1); grid.addWidget(self.source_browse_button,1,2); grid.addWidget(self.list_cams_button,1,3)
+        grid.addWidget(self.thresh_label,2,0); grid.addWidget(self.thresh_slider,2,1); grid.addWidget(self.thresh_value_label,2,2); grid.addWidget(self.autosave_checkbox,2,3)
+        grid.addWidget(self.fps_label,3,0); grid.addWidget(self.fps_combo,3,1); grid.addWidget(self.save_original_checkbox,3,2); grid.addWidget(self.beep_checkbox,3,3)
+        grid.addWidget(self.resolution_label,4,0); grid.addWidget(self.resolution_combo,4,1); grid.addWidget(self.low_latency_checkbox,4,2,1,2)
+        grid.addWidget(self.codec_label,5,0); grid.addWidget(self.codec_combo,5,1)
+        h=QHBoxLayout();
+        for w in [self.start_button,self.stop_button,self.pause_button,self.capture_button,self.record_button,self.set_roi_button,self.clear_roi_button]: h.addWidget(w)
+        v=QVBoxLayout(); v.addLayout(grid); v.addLayout(h); v.addWidget(self.image_display_label,1); v.addWidget(self.status_label)
+        c=QWidget(); c.setLayout(v); self.setCentralWidget(c)
+        # Signals
         self.model_browse_button.clicked.connect(self.browse_model_file)
         self.source_browse_button.clicked.connect(self.browse_source_file)
+        self.list_cams_button.clicked.connect(self.list_cameras_dialog)
         self.thresh_slider.valueChanged.connect(self.update_threshold)
         self.start_button.clicked.connect(self.start_detection)
         self.stop_button.clicked.connect(self.stop_detection)
@@ -553,278 +487,198 @@ class MainWindow(QMainWindow):
         self.image_display_label.roi_selected.connect(self.set_roi)
         self.set_roi_button.clicked.connect(self.start_roi_selection)
         self.clear_roi_button.clicked.connect(self.clear_roi)
-
-        # MODIFIED: Set the persistent ROI rectangle if loaded from config
         if self.roi:
-            x, y, w, h = self.roi
-            # The ROISelectorLabel no longer draws the persistent box, so this is no longer needed.
-            self.status_label.setText(f"ROI loaded from config: x={x}, y={y}, w={w}, h={h}")
-            self.clear_roi_button.setEnabled(True)
+            x,y,w,h=self.roi; self.status_label.setText(f"ROI loaded from config: x={x}, y={y}, w={w}, h={h}"); self.clear_roi_button.setEnabled(True)
         else:
             self.status_label.setText("Ready")
-
-
+    # camera listing
+    def _try_open_camera_with_backends(self, index:int):
+        print(f"Entering MainWindow._try_open_camera_with_backends")
+        # MODIFIED: Try DSHOW first as requested.
+        for backend,name in [(cv2.CAP_DSHOW,"DSHOW"),(cv2.CAP_MSMF,"MSMF"),(0,"ANY")]:
+            try:
+                cap=cv2.VideoCapture(index, backend) if backend!=0 else cv2.VideoCapture(index)
+                if not cap.isOpened():
+                    cap.release(); continue
+                try: cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+                except Exception: pass
+                ok,_=cap.read()
+                if not ok:
+                    cap.release(); continue
+                return cap,name
+            except Exception:
+                try: cap.release()
+                except Exception: pass
+        return None,None
+    def list_cameras_dialog(self, max_index:int=10):
+        print(f"Entering MainWindow.list_cameras_dialog")
+        lines=[]
+        for idx in range(max_index):
+            cap,backend=self._try_open_camera_with_backends(idx)
+            if cap is None: continue
+            try:
+                rw=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); rh=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                rf=cap.get(cv2.CAP_PROP_FPS); fc=int_fourcc_to_str(int(cap.get(cv2.CAP_PROP_FOURCC)))
+            except Exception:
+                rw,rh,rf,fc=0,0,0.0,"----"
+            lines.append(f"Index {idx}: {rw}x{rh} @ ~{rf:.1f} FPS, FOURCC={fc}, backend={backend}")
+            cap.release()
+        if not lines:
+            QMessageBox.information(self, "List Cameras", f"No cameras detected (0..{max_index-1})"); return
+        msg="Available camera indices:\n"+"\n".join(lines)+"\n\n(ใส่เลข index นี้ในช่อง Source ได้เลย)"
+        QMessageBox.information(self, "List Cameras", msg)
+    # GUI actions
     def start_roi_selection(self):
-        # The ROISelectorLabel will draw the dashed line during selection.
-        self.image_display_label.start_selection()
-        self.status_label.setText("สถานะ: คลิกและลากเพื่อกำหนดพื้นที่ (ROI)")
-
+        print(f"Entering MainWindow.start_roi_selection")
+        self.image_display_label.start_selection(); self.status_label.setText("สถานะ: คลิกและลากเพื่อกำหนดพื้นที่ (ROI)")
     def browse_model_file(self):
-        """Opens a file dialog to select a YOLO model (.pt file)."""
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select YOLO Model", "", "PyTorch Model (*.pt)")
-        if file_path:
-            self.model_path_input.setText(file_path)
-
+        print(f"Entering MainWindow.browse_model_file")
+        p,_=QFileDialog.getOpenFileName(self,"Select YOLO Model","","PyTorch Model (*.pt)")
+        if p: self.model_path_input.setText(p)
     def browse_source_file(self):
-        """Opens a file dialog to select a video or image file."""
-        filter_str = "All Supported Files (*.mp4 *.avi *.mov *.mkv *.wmv *.jpg *.jpeg *.png *.bmp);;" \
-                     "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv);;" \
-                     "Image Files (*.jpg *.jpeg *.png *.bmp)"
-        
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Source File", "", filter_str)
-        if file_path:
-            self.source_path_input.setText(file_path)
-            
-    def update_threshold(self, value):
-        """Updates the confidence threshold value and label."""
-        thresh_float = value / 100.0
-        self.thresh_value_label.setText(f"{thresh_float:.2f}")
-        if self.worker:
-            self.worker.threshold = thresh_float
-
+        print(f"Entering MainWindow.browse_source_file")
+        filt=("All Supported Files (*.mp4 *.avi *.mov *.mkv *.wmv *.jpg *.jpeg *.png *.bmp);;"
+              "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv);;"
+              "Image Files (*.jpg *.jpeg *.png *.bmp)")
+        p,_=QFileDialog.getOpenFileName(self,"Select Source File","",filt)
+        if p: self.source_path_input.setText(p)
+    def update_threshold(self, v:int):
+        #print(f"Entering MainWindow.update_threshold")
+        t=v/100.0; self.thresh_value_label.setText(f"{t:.2f}")
+        if self.worker: self.worker.threshold=t
     def start_detection(self):
-        """Starts the object detection process in a new worker thread."""
-        model_path = self.model_path_input.text()
-        source = self.source_path_input.text()
-        threshold = self.thresh_slider.value() / 100.0
-        autosave_enabled = self.autosave_checkbox.isChecked()
-        save_original_enabled = self.save_original_checkbox.isChecked()
-        beep_enabled = self.beep_checkbox.isChecked()
-        
-        fps_text = self.fps_combo.currentText()
-        if fps_text == "Full Speed":
-            target_fps = 0
-        else:
-            target_fps = int(fps_text.split(" ")[0])
+        print(f"Entering MainWindow.start_detection")
+        model_path=self.model_path_input.text(); source=self.source_path_input.text()
+        threshold=self.thresh_slider.value()/100.0
+        autosave=self.autosave_checkbox.isChecked(); save_orig=self.save_original_checkbox.isChecked()
+        beep=self.beep_checkbox.isChecked(); lowlat=self.low_latency_checkbox.isChecked()
+        fps_text=self.fps_combo.currentText(); target_fps=0 if fps_text=="Full Speed" else int(fps_text.split(" ")[0])
+        # codec
+        codec_key=self.codec_combo.currentText(); codec_choice=CODEC_MAP.get(codec_key)
+        # webcam + resolution
+        is_webcam=False; desired_res=None
+        try: int(source); is_webcam=True
+        except ValueError: is_webcam=False
+        rtxt=self.resolution_combo.currentText()
+        if is_webcam and rtxt!="Source/Native":
+            try:
+                wstr,hstr=rtxt.split("x")
+                desired_res=(int(wstr), int(hstr))
+                
+                # --- MODIFICATION START ---
+                # Hardcode the desired height to 120 as requested.
+                if desired_res is not None:
+                    #desired_res = (desired_res[0], 120)
+                    desired_res = (desired_res[0], 1000)
+                # --- MODIFICATION END ---
+
+            except Exception:
+                desired_res=None
 
         if not os.path.exists(model_path):
-            QMessageBox.critical(self, "Error", "Model file not found!")
-            return
-
-        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
-        is_image = any(source.lower().endswith(ext) for ext in image_extensions)
-        
+            QMessageBox.critical(self,"Error","Model file not found!"); return
+        exts=['.jpg','.jpeg','.png','.bmp']; is_image=any(source.lower().endswith(e) for e in exts)
         self.start_button.setEnabled(False)
         if not is_image:
-            self.stop_button.setEnabled(True)
-            self.pause_button.setEnabled(True)
-            self.capture_button.setEnabled(True)
-            self.record_button.setEnabled(True)
-            self.clear_roi_button.setEnabled(True)
-        
-        # Clean up previous worker/thread before starting a new one
+            for b in [self.stop_button,self.pause_button,self.capture_button,self.record_button,self.clear_roi_button]: b.setEnabled(True)
         if self.worker:
-            self.worker.stop()
-            self.video_thread.quit()
-            self.video_thread.wait()
-            self.worker.deleteLater()
-        
-        self.worker = Worker(model_path, source, threshold, is_image, autosave_enabled, target_fps, save_original_enabled, beep_enabled, self.roi)
+            self.worker.stop(); self.video_thread.quit(); self.video_thread.wait(); self.worker.deleteLater()
+        self.worker=Worker(model_path, source, threshold, is_image, autosave, target_fps, save_orig, beep,
+                           self.roi, desired_res, is_webcam, lowlat, codec_choice)
         self.worker.moveToThread(self.video_thread)
         self.video_thread.started.connect(self.worker.run)
         self.worker.image_update.connect(self.update_image)
         self.worker.status_update.connect(self.update_status)
         self.worker.finished.connect(self.detection_finished)
         self.video_thread.start()
-        
     def stop_detection(self):
-        """Stops the worker thread and the detection process."""
+        print(f"Entering MainWindow.stop_detection")
         self.status_label.setText("Stopping...")
         if self.worker:
-            self.worker.stop()
-            self.video_thread.quit()
-            self.video_thread.wait()
-        
+            self.worker.stop(); self.video_thread.quit(); self.video_thread.wait()
     def detection_finished(self):
-        """Resets the GUI state and writes the detection summary file."""
+        print(f"Entering MainWindow.detection_finished")
         self.write_summary_file()
-
-        if hasattr(self.worker, 'is_image_source') and not self.worker.is_image_source:
-             self.image_display_label.setText("Processing finished. Press 'Start' to begin again.")
-        self.stop_button.setEnabled(False)
-        self.pause_button.setEnabled(False)
-        self.pause_button.setChecked(False)
-        self.pause_button.setText("Pause")
-        self.capture_button.setEnabled(False)
-        self.record_button.setEnabled(False)
-        self.record_button.setChecked(False)
-        self.record_button.setText("Start Recording")
-        self.clear_roi_button.setEnabled(False)
-        self.start_button.setEnabled(True)
-        # Clear the worker instance
-        self.worker = None
-
+        if hasattr(self.worker,'is_image_source') and not self.worker.is_image_source:
+            self.image_display_label.setText("Processing finished. Press 'Start' to begin again.")
+        for b in [self.stop_button,self.pause_button,self.capture_button,self.record_button]: b.setEnabled(False)
+        self.pause_button.setChecked(False); self.pause_button.setText("Pause")
+        self.record_button.setChecked(False); self.record_button.setText("Start Recording")
+        self.clear_roi_button.setEnabled(False); self.start_button.setEnabled(True); self.worker=None
     def update_image(self, pixmap):
-        """Updates the display label with the new frame."""
-        self.current_pixmap = pixmap
-        self.image_display_label.setPixmap(pixmap.scaled(
-            self.image_display_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
-
-    def update_status(self, message):
-        """Updates the status bar with current messages."""
-        self.status_label.setText(message)
-
-    def set_roi(self, selection_rect):
-        """Receives ROI coordinates from the ROILabel and stores them."""
-        # Use QPixmap to get the dimensions of the displayed image after scaling
-        pixmap = self.image_display_label.pixmap()
-        if not pixmap or pixmap.isNull():
-            self.status_label.setText("Cannot set ROI: No image displayed.")
-            return
-
-        label_size = self.image_display_label.size()
-        scaled_pixmap_size = pixmap.size().scaled(label_size, Qt.AspectRatioMode.KeepAspectRatio)
-        offset_x = (label_size.width() - scaled_pixmap_size.width()) / 2
-        offset_y = (label_size.height() - scaled_pixmap_size.height()) / 2
-        
-        if scaled_pixmap_size.width() == 0 or scaled_pixmap_size.height() == 0:
-            self.status_label.setText("Cannot set ROI: Invalid image size.")
-            return
-
-        # Get original frame dimensions from worker for accurate scaling
+        #print(f"Entering MainWindow.update_image")
+        self.current_pixmap=pixmap
+        self.image_display_label.setPixmap(pixmap.scaled(self.image_display_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+    def update_status(self, msg:str):
+        #print(f"Entering MainWindow.update_status")
+        self.status_label.setText(msg)
+    def set_roi(self, rect:QRect):
+        print(f"Entering MainWindow.set_roi")
+        pm=self.image_display_label.pixmap()
+        if not pm or pm.isNull(): self.status_label.setText("Cannot set ROI: No image displayed."); return
+        L=self.image_display_label.size(); S=pm.size().scaled(L, Qt.AspectRatioMode.KeepAspectRatio)
+        ox=(L.width()-S.width())/2; oy=(L.height()-S.height())/2
+        if S.width()==0 or S.height()==0: self.status_label.setText("Cannot set ROI: Invalid image size."); return
         if self.worker and self.worker.latest_frame is not None:
-             h_orig, w_orig = self.worker.latest_frame.shape[0], self.worker.latest_frame.shape[1]
+            h0,w0=self.worker.latest_frame.shape[0], self.worker.latest_frame.shape[1]
         else:
-             # Fallback if worker is not running, assume a common resolution
-             h_orig, w_orig = 1080, 1920
-             
-        scale_x = w_orig / scaled_pixmap_size.width()
-        scale_y = h_orig / scaled_pixmap_size.height()
-        
-        x1 = int((selection_rect.left() - offset_x) * scale_x)
-        y1 = int((selection_rect.top() - offset_y) * scale_y)
-        x2 = int((selection_rect.right() - offset_x) * scale_x)
-        y2 = int((selection_rect.bottom() - offset_y) * scale_y)
-        
-        final_x1 = max(0, x1)
-        final_y1 = max(0, y1)
-        final_x2 = min(w_orig, x2)
-        final_y2 = min(h_orig, y2)
-        
-        self.roi = (final_x1, final_y1, final_x2-final_x1, final_y2-final_y1)
-        
-        # Update worker's ROI immediately if it's running
-        if self.worker:
-            self.worker.update_roi(self.roi)
-        
+            h0,w0=1080,1920
+        sx=w0/S.width(); sy=h0/S.height()
+        x1=int((rect.left()-ox)*sx); y1=int((rect.top()-oy)*sy); x2=int((rect.right()-ox)*sx); y2=int((rect.bottom()-oy)*sy)
+        x1=max(0,x1); y1=max(0,y1); x2=min(w0,x2); y2=min(h0,y2)
+        self.roi=(x1,y1,x2-x1,y2-y1)
+        if self.worker: self.worker.update_roi(self.roi)
         self.status_label.setText(f"ROI selected: x={self.roi[0]}, y={self.roi[1]}, w={self.roi[2]}, h={self.roi[3]}")
-        
-        # Save ROI to config immediately after selection
-        self.save_config_with_roi()
-        self.clear_roi_button.setEnabled(True)
-
-    
+        self.save_config_with_roi(); self.clear_roi_button.setEnabled(True)
     def clear_roi(self):
-        """Clears the selected ROI."""
-        self.roi = None
-        self.image_display_label.clear_roi()
-        
-        # Update worker's ROI immediately if it's running
-        if self.worker:
-            self.worker.update_roi(None)
-
+        print(f"Entering MainWindow.clear_roi")
+        self.roi=None; self.image_display_label.clear_roi()
+        if self.worker: self.worker.update_roi(None)
         self.status_label.setText("ROI cleared. Detection will cover the full frame.")
-        
-        # Save cleared ROI to config
-        self.save_config_with_roi()
-        self.clear_roi_button.setEnabled(False)
-    
+        self.save_config_with_roi(); self.clear_roi_button.setEnabled(False)
     def capture_frame(self):
-        """Captures and saves the currently displayed frame as an image."""
-        if self.current_pixmap is None:
-            self.status_label.setText("No active stream to capture.")
-            return
-        output_dir = 'outputs'
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = int(time.time())
-        file_name = f"capture_{timestamp}.png"
-        save_path = os.path.join(output_dir, file_name)
-        if self.current_pixmap.save(save_path):
-            self.status_label.setText(f"Frame captured and saved to {save_path}")
-        else:
-            self.status_label.setText(f"Failed to save frame to {save_path}")
-    
+        print(f"Entering MainWindow.capture_frame")
+        if self.worker is None or self.worker.latest_frame is None: 
+            self.status_label.setText("No active stream to capture."); return
+        out='outputs'; os.makedirs(out, exist_ok=True); ts=int(time.time()); path=os.path.join(out, f"capture_{ts}.png")
+        # Save original frame without labels
+        with self.worker.lock:
+            original_frame = self.worker.latest_frame.copy()
+        if cv2.imwrite(path, original_frame): self.status_label.setText(f"Frame captured and saved to {path}")
+        else: self.status_label.setText(f"Failed to save frame to {path}")
     def write_summary_file(self):
-        """Writes a text file summarizing the total objects detected."""
+        #print(f"Entering MainWindow.write_summary_file")
         if not self.worker or not self.worker.detection_summary:
-            self.status_label.setText("Finished. No objects were detected.")
-            return
-
-        summary = self.worker.detection_summary
-        output_dir = 'outputs'
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_name = f"Result_{timestamp}.txt"
-        save_path = os.path.join(output_dir, file_name)
-        total_objects = sum(summary.values())
-
-        with open(save_path, 'w', encoding='utf-8') as f:
-            f.write(f"Detection Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*40 + "\n")
-            for class_name, count in sorted(summary.items()):
-                f.write(f"- {class_name}: {count}\n")
-            f.write("="*40 + "\n")
-            f.write(f"Total Objects Detected: {total_objects}\n")
-        
-        self.status_label.setText(f"Finished. Summary saved to {save_path}")
-
-    def toggle_recording(self, checked):
-        """Toggles the video recording on and off."""
-        if self.worker:
-            self.worker.set_recording_state(checked)
-            if checked:
-                self.record_button.setText("Stop Recording")
-            else:
-                self.record_button.setText("Start Recording")
-
-    def toggle_pause(self, checked):
-        """Pauses or resumes the detection process."""
+            self.status_label.setText("Finished. No objects were detected."); return
+        summary=self.worker.detection_summary; out='outputs'; os.makedirs(out, exist_ok=True)
+        ts=datetime.now().strftime('%Y%m%d_%H%M%S'); path=os.path.join(out, f"Result_{ts}.txt")
+        total=sum(summary.values())
+        with open(path,'w',encoding='utf-8') as f:
+            f.write(f"Detection Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"); f.write("="*40+"\n")
+            for name,cnt in sorted(summary.items()): f.write(f"- {name}: {cnt}\n")
+            f.write("="*40+"\n"); f.write(f"Total Objects Detected: {total}\n")
+        self.status_label.setText(f"Finished. Summary saved to {path}")
+    def toggle_recording(self, checked:bool):
+        print(f"Entering MainWindow.toggle_recording")
+        if self.worker: self.worker.set_recording_state(checked); self.record_button.setText("Stop Recording" if checked else "Start Recording")
+    def toggle_pause(self, checked:bool):
+        print(f"Entering MainWindow.toggle_pause")
         if self.worker:
             self.worker.set_pause_state(checked)
-            if checked:
-                self.pause_button.setText("Resume")
-                self.status_label.setText("Paused.")
-            else:
-                self.pause_button.setText("Pause")
-                self.status_label.setText("Processing...")
-
+            if checked: self.pause_button.setText("Resume"); self.status_label.setText("Paused.")
+            else: self.pause_button.setText("Pause"); self.status_label.setText("Processing...")
     def save_config_with_roi(self):
-        """Saves the current settings and ROI to the config file."""
-        self.config['model_path'] = self.model_path_input.text()
-        self.config['source_path'] = self.source_path_input.text()
-        self.config['threshold'] = self.thresh_slider.value() / 100.0
-        self.config['autosave'] = self.autosave_checkbox.isChecked()
-        self.config['fps_index'] = self.fps_combo.currentIndex()
-        self.config['save_original'] = self.save_original_checkbox.isChecked()
-        self.config['beep'] = self.beep_checkbox.isChecked()
-        self.config['roi'] = self.roi # ADDED: Save the ROI tuple
-        save_config(self.config)
-
-    def closeEvent(self, event):
-        """Saves settings and stops the worker thread when the application is closed."""
-        self.save_config_with_roi()
-        self.stop_detection()
-        super().closeEvent(event)
-
+        print(f"Entering MainWindow.save_config_with_roi")
+        self.config['model_path']=self.model_path_input.text(); self.config['source_path']=self.source_path_input.text()
+        self.config['threshold']=self.thresh_slider.value()/100.0; self.config['autosave']=self.autosave_checkbox.isChecked()
+        self.config['fps_index']=self.fps_combo.currentIndex(); self.config['save_original']=self.save_original_checkbox.isChecked()
+        self.config['beep']=self.beep_checkbox.isChecked(); self.config['roi']=self.roi
+        self.config['resolution_index']=self.resolution_combo.currentIndex(); self.config['low_latency']=self.low_latency_checkbox.isChecked()
+        self.config['codec']=self.codec_combo.currentText(); save_config(self.config)
+    def closeEvent(self, e):
+        print(f"Entering MainWindow.closeEvent")
+        self.save_config_with_roi(); self.stop_detection(); super().closeEvent(e)
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
-
-
-
-
+    print(f"Entering main execution block")
+    app=QApplication(sys.argv); w=MainWindow(); w.show(); sys.exit(app.exec())

@@ -11,5 +11,8 @@
         155,
         331,
         227
-    ]
+    ],
+    "resolution_index": 3,
+    "low_latency": false,
+    "codec": "XVID"
 }
