@@ -167,7 +167,7 @@ class ROISelectorLabel(QLabel):
         super().paintEvent(e)
         p = QPainter(self)
         if self.is_selecting:
-            p.setPen(QPen(Qt.GlobalColor.blue, 2, Qt.PenStyle.DashLine))
+            p.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.DashLine))
             p.drawRect(QRect(self.start_point, self.end_point).normalized())
         p.setPen(QPen(Qt.GlobalColor.red, 1))
         pm = self.pixmap()
@@ -221,8 +221,10 @@ class Worker(QObject):
         except Exception as e:
             self.status_update.emit(f"Error: {e}")
         finally:
-            if self.is_recording: self.stop_recording()
+            if self.is_recording:
+                self.stop_recording()
             self.finished.emit()
+            print("Worker.run finished.")
     def play_beep(self):
         #print(f"Entering Worker.play_beep")
         if self.beep_enabled and winsound: winsound.Beep(800,100)
@@ -294,15 +296,15 @@ class Worker(QObject):
                     rx,ry,_,_=self.roi; xmin+=rx; ymin+=ry; xmax+=rx; ymax+=ry
                 self.detection_summary[name]=self.detection_summary.get(name,0)+1
                 self.total_objects_detected += 1
-                cv2.rectangle(detected_frame,(xmin,ymin),(xmax,ymax),(0,255,0),2)
+                cv2.rectangle(detected_frame,(xmin,ymin),(xmax,ymax),(0,0,255),2)
                 cv2.putText(detected_frame,label,(xmin,ymin-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
         if self.roi and all(v>=0 for v in self.roi):
-            x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(255,0,0),3)
+            x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(0,0,255),3)
         # Count objects in this frame
         frame_count = sum(1 for i in range(len(detections)) if detections[i].conf.item() > self.threshold)
         cv2.putText(detected_frame,f'Frame: {frame_count} | Total: {self.total_objects_detected}',(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
         self.status_update.emit("Detection saved." if object_found and self.autosave_enabled else ("Object detected (Auto-save is off)." if object_found else "No objects detected in the image."))
-        cv2.putText(detected_frame,f'Res: {detected_frame.shape[1]}x{detected_frame.shape[0]}',(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,255,255),2)
+        cv2.putText(detected_frame,f'Res: {detected_frame.shape[1]}x{detected_frame.shape[0]}',(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,0,255),2)
         self.display_frame(detected_frame)
     def process_video_stream(self, model, labels):
         print(f"Entering Worker.process_video_stream")
@@ -355,16 +357,16 @@ class Worker(QObject):
                         rx,ry,_,_=self.roi; xmin+=rx; ymin+=ry; xmax+=rx; ymax+=ry
                     self.detection_summary[name]=self.detection_summary.get(name,0)+1
                     self.total_objects_detected += 1
-                    cv2.rectangle(detected_frame,(xmin,ymin),(xmax,ymax),(0,255,0),2)
+                    cv2.rectangle(detected_frame,(xmin,ymin),(xmax,ymax),(0,0,255),2)
                     cv2.putText(detected_frame,label,(xmin,ymin-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
             if found:
                 self.play_beep()
                 if self.autosave_enabled: self.save_detection_images(frame, detected_frame)
             if self.roi and all(v>=0 for v in self.roi):
-                x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(255,0,0),3)
+                x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(0,0,255),3)
             cv2.putText(detected_frame,f'Frame: {count} | Total: {self.total_objects_detected}',(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
             cv2.putText(detected_frame,f'FPS: {self.avg_fps:.2f}',(detected_frame.shape[1]-150,40),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
-            cv2.putText(detected_frame,f'Res: {detected_frame.shape[1]}x{detected_frame.shape[0]}',(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,255,255),2)
+            cv2.putText(detected_frame,f'Res: {detected_frame.shape[1]}x{detected_frame.shape[0]}',(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,0,255),2)
             if self.is_recording:
                 cv2.circle(detected_frame,(detected_frame.shape[1]-30,80),10,(0,0,255),-1)
                 cv2.putText(detected_frame,'REC',(detected_frame.shape[1]-80,85),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
@@ -594,8 +596,14 @@ class MainWindow(QMainWindow):
     def stop_detection(self):
         print(f"Entering MainWindow.stop_detection")
         self.status_label.setText("Stopping...")
-        if self.worker:
-            self.worker.stop(); self.video_thread.quit(); self.video_thread.wait()
+        if self.worker and self.video_thread.isRunning():
+            self.worker.stop()
+            self.video_thread.quit()
+            # Wait for the thread to finish. Add a timeout to prevent indefinite blocking.
+            if not self.video_thread.wait(5000): # 5-second timeout
+                print("Warning: Worker thread did not terminate gracefully. Forcing termination.")
+                self.video_thread.terminate()
+                self.video_thread.wait() # Wait again after termination
     def detection_finished(self):
         print(f"Entering MainWindow.detection_finished")
         self.write_summary_file()
@@ -681,4 +689,13 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     print(f"Entering main execution block")
+    print('is_available =', torch.cuda.is_available())
+    print('cuda ver     =', torch.version.cuda)
+    if torch.cuda.is_available():
+        print('device name  =', torch.cuda.get_device_name(0))
     app=QApplication(sys.argv); w=MainWindow(); w.show(); sys.exit(app.exec())
+
+
+
+     
+ 

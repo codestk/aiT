@@ -1,6 +1,7 @@
 outputs/
 data/
 runs/
+custom_data/
 *.pt
 *.mp4
 *.jpg
