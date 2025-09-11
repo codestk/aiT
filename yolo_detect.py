@@ -136,39 +136,121 @@ def save_config(data):
 
 class ROISelectorLabel(QLabel):
     roi_selected = pyqtSignal(QRect)
+    roi_polygon_selected = pyqtSignal(list)
     def __init__(self, parent=None):
         #print(f"Entering ROISelectorLabel.__init__")
         super().__init__(parent)
+        self.mode = 'none'  # 'none' | 'rect' | 'poly'
         self.is_selecting = False
         self.start_point = QPoint(); self.end_point = QPoint()
+        self.poly_points: list[QPoint] = []
+        self.preview_point: QPoint|None = None
         self.setMouseTracking(True); self.setCursor(Qt.CursorShape.ArrowCursor)
     def start_selection(self):
-        #print(f"Entering ROISelectorLabel.start_selection")
+        #print(f"Entering ROISelectorLabel.start_selection (rect)")
+        self.mode = 'rect'
         self.is_selecting = True; self.setCursor(Qt.CursorShape.CrossCursor); self.update()
+    def start_freeform_selection(self):
+        #print(f"Entering ROISelectorLabel.start_freeform_selection (poly)")
+        self.mode = 'poly'
+        self.is_selecting = True
+        self.poly_points = []
+        self.preview_point = None
+        self.setCursor(Qt.CursorShape.CrossCursor); self.update()
     def mousePressEvent(self, e):
         #print(f"Entering ROISelectorLabel.mousePressEvent")
-        if self.is_selecting and e.button() == Qt.MouseButton.LeftButton:
+        if self.mode == 'rect' and self.is_selecting and e.button() == Qt.MouseButton.LeftButton:
             self.start_point = e.pos(); self.end_point = self.start_point; self.update()
+        elif self.mode == 'poly' and self.is_selecting and e.button() == Qt.MouseButton.LeftButton:
+            # Left-click while drawing polygon: add point or auto-close if near start
+            click_pt = e.pos()
+            self.preview_point = click_pt
+            # If close to the first point and we already have at least 3 points, auto-finish
+            try:
+                close_thresh = 12  # pixels on the label coordinates
+                if len(self.poly_points) >= 3:
+                    p0 = self.poly_points[0]
+                    dx = click_pt.x() - p0.x(); dy = click_pt.y() - p0.y()
+                    if (dx*dx + dy*dy) ** 0.5 <= close_thresh:
+                        # Finish polygon without adding another vertex on top of p0
+                        self.is_selecting = False; self.setCursor(Qt.CursorShape.ArrowCursor)
+                        self.roi_polygon_selected.emit(self.poly_points.copy())
+                        self.poly_points = []
+                        self.preview_point = None
+                        self.mode = 'none'
+                        self.update()
+                        super().mousePressEvent(e)
+                        return
+            except Exception:
+                pass
+            # Otherwise keep collecting points
+            self.poly_points.append(click_pt); self.update()
+        elif self.mode == 'poly' and self.is_selecting and e.button() == Qt.MouseButton.RightButton:
+            # Finish polygon on right-click if >= 3 points
+            if len(self.poly_points) >= 3:
+                self.is_selecting = False; self.setCursor(Qt.CursorShape.ArrowCursor)
+                self.roi_polygon_selected.emit(self.poly_points.copy())
+                self.poly_points = []
+                self.preview_point = None
+                self.mode = 'none'
+                self.update()
         super().mousePressEvent(e)
+    def mouseDoubleClickEvent(self, e):
+        # Double-click to finish polygon as well
+        if self.mode == 'poly' and self.is_selecting and len(self.poly_points) >= 3:
+            self.is_selecting = False; self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.roi_polygon_selected.emit(self.poly_points.copy())
+            self.poly_points = []
+            self.preview_point = None
+            self.mode = 'none'
+            self.update()
+        super().mouseDoubleClickEvent(e)
     def mouseMoveEvent(self, e):
         #print(f"Entering ROISelectorLabel.mouseMoveEvent")
-        if self.is_selecting and e.buttons() == Qt.MouseButton.LeftButton:
+        if self.mode == 'rect' and self.is_selecting and e.buttons() == Qt.MouseButton.LeftButton:
             self.end_point = e.pos(); self.update()
+        elif self.mode == 'poly' and self.is_selecting:
+            self.preview_point = e.pos(); self.update()
         super().mouseMoveEvent(e)
     def mouseReleaseEvent(self, e):
         #print(f"Entering ROISelectorLabel.mouseReleaseEvent")
-        if self.is_selecting and e.button() == Qt.MouseButton.LeftButton:
+        if self.mode == 'rect' and self.is_selecting and e.button() == Qt.MouseButton.LeftButton:
             self.is_selecting = False; self.setCursor(Qt.CursorShape.ArrowCursor)
             self.roi_selected.emit(QRect(self.start_point, self.end_point).normalized())
+            self.mode = 'none'
             self.update()
         super().mouseReleaseEvent(e)
     def paintEvent(self, e):
         #print(f"Entering ROISelectorLabel.paintEvent")
         super().paintEvent(e)
         p = QPainter(self)
-        if self.is_selecting:
+        if self.mode == 'rect' and self.is_selecting:
             p.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.DashLine))
             p.drawRect(QRect(self.start_point, self.end_point).normalized())
+        elif self.mode == 'poly' and self.is_selecting:
+            p.setPen(QPen(Qt.GlobalColor.green, 2, Qt.PenStyle.SolidLine))
+            # Draw points and segments
+            for i in range(1, len(self.poly_points)):
+                p.drawLine(self.poly_points[i-1], self.poly_points[i])
+            for pt in self.poly_points:
+                p.drawEllipse(pt, 2, 2)
+            # Preview line to current mouse; if cursor is near the start point,
+            # hint that the shape will close.
+            if self.preview_point is not None and len(self.poly_points) > 0:
+                p.setPen(QPen(Qt.GlobalColor.green, 1, Qt.PenStyle.DashLine))
+                try:
+                    if len(self.poly_points) >= 3:
+                        p0 = self.poly_points[0]
+                        dx = self.preview_point.x() - p0.x(); dy = self.preview_point.y() - p0.y()
+                        if (dx*dx + dy*dy) ** 0.5 <= 12:
+                            p.drawLine(self.poly_points[-1], p0)
+                        else:
+                            p.drawLine(self.poly_points[-1], self.preview_point)
+                    else:
+                        p.drawLine(self.poly_points[-1], self.preview_point)
+                except Exception:
+                    p.drawLine(self.poly_points[-1], self.preview_point)
+        # Center crosshair
         p.setPen(QPen(Qt.GlobalColor.red, 1))
         pm = self.pixmap()
         if pm and not pm.isNull():
@@ -178,7 +260,7 @@ class ROISelectorLabel(QLabel):
             p.drawLine(cx-arm, cy, cx+arm, cy); p.drawLine(cx, cy-arm, cx, cy+arm)
     def clear_roi(self):
         print(f"Entering ROISelectorLabel.clear_roi")
-        self.is_selecting=False; self.update()
+        self.is_selecting=False; self.mode='none'; self.poly_points=[]; self.preview_point=None; self.update()
 
 class Worker(QObject):
     image_update = pyqtSignal(QPixmap)
@@ -186,14 +268,14 @@ class Worker(QObject):
     finished = pyqtSignal()
     def __init__(self, model_path, source, initial_thresh, is_image_source,
                  autosave_enabled, target_fps, save_original_enabled, beep_enabled,
-                 roi=None, desired_resolution=None, is_webcam_source=False,
+                 roi=None, roi_poly=None, desired_resolution=None, is_webcam_source=False,
                  low_latency_mode=False, codec_choice: str|None=None):
         print(f"Entering Worker.__init__")
         super().__init__()
         self.model_path=model_path; self.source=source; self.threshold=initial_thresh
         self.is_image_source=is_image_source; self.autosave_enabled=autosave_enabled
         self.save_original_enabled=save_original_enabled; self.beep_enabled=beep_enabled
-        self.target_fps=target_fps; self.roi=roi; self.desired_resolution=desired_resolution
+        self.target_fps=target_fps; self.roi=roi; self.roi_poly=roi_poly; self.desired_resolution=desired_resolution
         self.is_webcam_source=is_webcam_source; self.low_latency_mode=low_latency_mode
         self.codec_choice = codec_choice  # 'MJPG'/'YUY2'/'H264'/None
         self._is_running=True; self.video_writer=None; self.is_recording=False
@@ -279,7 +361,15 @@ class Worker(QObject):
         if frame is None: raise IOError(f"Cannot read image file: {self.source}")
         with self.lock: self.latest_frame=frame.copy()
         detected_frame=frame.copy()
-        if self.roi and all(v>=0 for v in self.roi):
+        use_masked=False
+        if self.roi_poly and isinstance(self.roi_poly, (list, tuple)) and len(self.roi_poly) >= 3:
+            # Apply polygon mask
+            mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+            pts = np.array(self.roi_poly, dtype=np.int32)
+            cv2.fillPoly(mask, [pts], 255)
+            cropped_frame = cv2.bitwise_and(frame, frame, mask=mask)
+            use_masked=True
+        elif self.roi and all(v>=0 for v in self.roi):
             x,y,w,h=self.roi; x=max(0,x); y=max(0,y); w=min(w, frame.shape[1]-x); h=min(h, frame.shape[0]-y)
             cropped_frame=frame[y:y+h, x:x+w]
         else:
@@ -292,13 +382,16 @@ class Worker(QObject):
                 object_found=True
                 xmin,ymin,xmax,ymax = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
                 cls=int(detections[i].cls.item()); name=labels[cls]; label=f"{name}: {int(conf*100)}%"
-                if self.roi and all(v>=0 for v in self.roi):
+                if (not use_masked) and self.roi and all(v>=0 for v in self.roi):
                     rx,ry,_,_=self.roi; xmin+=rx; ymin+=ry; xmax+=rx; ymax+=ry
                 self.detection_summary[name]=self.detection_summary.get(name,0)+1
                 self.total_objects_detected += 1
                 cv2.rectangle(detected_frame,(xmin,ymin),(xmax,ymax),(0,0,255),2)
                 cv2.putText(detected_frame,label,(xmin,ymin-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),2)
-        if self.roi and all(v>=0 for v in self.roi):
+        if self.roi_poly and isinstance(self.roi_poly, (list, tuple)) and len(self.roi_poly) >= 3:
+            pts = np.array(self.roi_poly, dtype=np.int32)
+            cv2.polylines(detected_frame, [pts], isClosed=True, color=(0,255,0), thickness=2)
+        elif self.roi and all(v>=0 for v in self.roi):
             x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(0,0,255),3)
         # Count objects in this frame
         frame_count = sum(1 for i in range(len(detections)) if detections[i].conf.item() > self.threshold)
@@ -340,12 +433,19 @@ class Worker(QObject):
             with self.lock: self.latest_frame=frame.copy()
             detected_frame=frame.copy(); found=False
             self.handle_recording_request(detected_frame)
-            if self.roi and all(v>=0 for v in self.roi):
+            use_masked=False
+            if self.roi_poly and isinstance(self.roi_poly, (list, tuple)) and len(self.roi_poly) >= 3:
+                mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                pts = np.array(self.roi_poly, dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 255)
+                source_for_model = cv2.bitwise_and(frame, frame, mask=mask)
+                use_masked=True
+            elif self.roi and all(v>=0 for v in self.roi):
                 x,y,w,h=self.roi; x=max(0,x); y=max(0,y); w=min(w, frame.shape[1]-x); h=min(h, frame.shape[0]-y)
-                cropped=frame[y:y+h, x:x+w]
+                source_for_model=frame[y:y+h, x:x+w]
             else:
-                cropped=frame
-            results=model(cropped, verbose=False, device='cuda:0' if torch.cuda.is_available() else 'cpu', half=True if torch.cuda.is_available() else False)
+                source_for_model=frame
+            results=model(source_for_model, verbose=False, device='cuda:0' if torch.cuda.is_available() else 'cpu', half=True if torch.cuda.is_available() else False)
             detections=results[0].boxes; count=0
             for i in range(len(detections)):
                 conf=detections[i].conf.item()
@@ -353,7 +453,7 @@ class Worker(QObject):
                     found=True; count+=1
                     xmin,ymin,xmax,ymax = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
                     cls=int(detections[i].cls.item()); name=labels[cls]; label=f"{name}: {int(conf*100)}%"
-                    if self.roi and all(v>=0 for v in self.roi):
+                    if (not use_masked) and self.roi and all(v>=0 for v in self.roi):
                         rx,ry,_,_=self.roi; xmin+=rx; ymin+=ry; xmax+=rx; ymax+=ry
                     self.detection_summary[name]=self.detection_summary.get(name,0)+1
                     self.total_objects_detected += 1
@@ -362,7 +462,10 @@ class Worker(QObject):
             if found:
                 self.play_beep()
                 if self.autosave_enabled: self.save_detection_images(frame, detected_frame)
-            if self.roi and all(v>=0 for v in self.roi):
+            if self.roi_poly and isinstance(self.roi_poly, (list, tuple)) and len(self.roi_poly) >= 3:
+                pts = np.array(self.roi_poly, dtype=np.int32)
+                cv2.polylines(detected_frame, [pts], isClosed=True, color=(0,255,0), thickness=2)
+            elif self.roi and all(v>=0 for v in self.roi):
                 x,y,w,h=self.roi; cv2.rectangle(detected_frame,(x,y),(x+w,y+h),(0,0,255),3)
             cv2.putText(detected_frame,f'Frame: {count} | Total: {self.total_objects_detected}',(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
             cv2.putText(detected_frame,f'FPS: {self.avg_fps:.2f}',(detected_frame.shape[1]-150,40),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
@@ -422,6 +525,9 @@ class Worker(QObject):
     def update_roi(self, new_roi):
         print(f"Entering Worker.update_roi")
         self.roi=new_roi
+    def update_roi_poly(self, new_poly):
+        print(f"Entering Worker.update_roi_poly")
+        self.roi_poly=new_poly
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -431,6 +537,7 @@ class MainWindow(QMainWindow):
         self.setGeometry(100,100,1000,800)
         self.config=load_config(); self.video_thread=QThread(); self.worker=None
         self.current_pixmap=None; self.roi=self.config.get("roi", None)
+        self.roi_poly=self.config.get("roi_poly", None)
         # Widgets
         self.model_label=QLabel("YOLO Model Path:"); self.model_path_input=QLineEdit(self.config.get("model_path",""))
         self.model_browse_button=QPushButton("Browse...")
@@ -458,6 +565,8 @@ class MainWindow(QMainWindow):
         self.start_button=QPushButton("Start Detection"); self.stop_button=QPushButton("Stop Detection")
         self.pause_button=QPushButton("Pause"); self.pause_button.setCheckable(True)
         self.capture_button=QPushButton("Capture Frame"); self.record_button=QPushButton("Start Recording"); self.record_button.setCheckable(True)
+        # Add freeform ROI button (Pen-like)
+        self.set_roi_poly_button=QPushButton("วาดเส้น ROI (อิสระ)")
         self.clear_roi_button=QPushButton("Clear ROI"); self.clear_roi_button.setEnabled(False)
         self.set_roi_button=QPushButton("กำหนดพื้นที่ (ROI)")
         self.image_display_label=ROISelectorLabel("Press 'Start Detection' to begin")
@@ -473,7 +582,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.resolution_label,4,0); grid.addWidget(self.resolution_combo,4,1); grid.addWidget(self.low_latency_checkbox,4,2,1,2)
         grid.addWidget(self.codec_label,5,0); grid.addWidget(self.codec_combo,5,1)
         h=QHBoxLayout();
-        for w in [self.start_button,self.stop_button,self.pause_button,self.capture_button,self.record_button,self.set_roi_button,self.clear_roi_button]: h.addWidget(w)
+        for w in [self.start_button,self.stop_button,self.pause_button,self.capture_button,self.record_button,self.set_roi_button,self.set_roi_poly_button,self.clear_roi_button]: h.addWidget(w)
         v=QVBoxLayout(); v.addLayout(grid); v.addLayout(h); v.addWidget(self.image_display_label,1); v.addWidget(self.status_label)
         c=QWidget(); c.setLayout(v); self.setCentralWidget(c)
         # Signals
@@ -487,9 +596,16 @@ class MainWindow(QMainWindow):
         self.capture_button.clicked.connect(self.capture_frame)
         self.record_button.clicked.connect(self.toggle_recording)
         self.image_display_label.roi_selected.connect(self.set_roi)
+        self.image_display_label.roi_polygon_selected.connect(self.set_roi_polygon)
         self.set_roi_button.clicked.connect(self.start_roi_selection)
+        try:
+            self.set_roi_poly_button.clicked.connect(self.start_roi_poly_selection)
+        except Exception:
+            pass
         self.clear_roi_button.clicked.connect(self.clear_roi)
-        if self.roi:
+        if self.roi_poly:
+            self.status_label.setText(f"ROI (poly) loaded from config: {len(self.roi_poly)} points"); self.clear_roi_button.setEnabled(True)
+        elif self.roi:
             x,y,w,h=self.roi; self.status_label.setText(f"ROI loaded from config: x={x}, y={y}, w={w}, h={h}"); self.clear_roi_button.setEnabled(True)
         else:
             self.status_label.setText("Ready")
@@ -533,6 +649,9 @@ class MainWindow(QMainWindow):
     def start_roi_selection(self):
         print(f"Entering MainWindow.start_roi_selection")
         self.image_display_label.start_selection(); self.status_label.setText("สถานะ: คลิกและลากเพื่อกำหนดพื้นที่ (ROI)")
+    def start_roi_poly_selection(self):
+        print(f"Entering MainWindow.start_roi_poly_selection")
+        self.image_display_label.start_freeform_selection(); self.status_label.setText("สถานะ: คลิกเพิ่มจุดทีละจุด แล้วดับเบิลคลิก/คลิกขวาเพื่อจบเส้น ROI")
     def browse_model_file(self):
         print(f"Entering MainWindow.browse_model_file")
         p,_=QFileDialog.getOpenFileName(self,"Select YOLO Model","","PyTorch Model (*.pt)")
@@ -586,7 +705,7 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.stop(); self.video_thread.quit(); self.video_thread.wait(); self.worker.deleteLater()
         self.worker=Worker(model_path, source, threshold, is_image, autosave, target_fps, save_orig, beep,
-                           self.roi, desired_res, is_webcam, lowlat, codec_choice)
+                           self.roi, self.roi_poly, desired_res, is_webcam, lowlat, codec_choice)
         self.worker.moveToThread(self.video_thread)
         self.video_thread.started.connect(self.worker.run)
         self.worker.image_update.connect(self.update_image)
@@ -635,13 +754,53 @@ class MainWindow(QMainWindow):
         x1=int((rect.left()-ox)*sx); y1=int((rect.top()-oy)*sy); x2=int((rect.right()-ox)*sx); y2=int((rect.bottom()-oy)*sy)
         x1=max(0,x1); y1=max(0,y1); x2=min(w0,x2); y2=min(h0,y2)
         self.roi=(x1,y1,x2-x1,y2-y1)
-        if self.worker: self.worker.update_roi(self.roi)
-        self.status_label.setText(f"ROI selected: x={self.roi[0]}, y={self.roi[1]}, w={self.roi[2]}, h={self.roi[3]}")
+        self.roi_poly=None
+        if self.worker:
+            self.worker.update_roi(self.roi)
+            try:
+                self.worker.update_roi_poly(None)
+            except Exception:
+                pass
+        self.status_label.setText(f"ROI (rect) selected: x={self.roi[0]}, y={self.roi[1]}, w={self.roi[2]}, h={self.roi[3]}")
+        self.save_config_with_roi(); self.clear_roi_button.setEnabled(True)
+    def set_roi_polygon(self, points:list):
+        print(f"Entering MainWindow.set_roi_polygon")
+        pm=self.image_display_label.pixmap()
+        if not pm or pm.isNull(): self.status_label.setText("Cannot set ROI: No image displayed."); return
+        L=self.image_display_label.size(); S=pm.size().scaled(L, Qt.AspectRatioMode.KeepAspectRatio)
+        ox=(L.width()-S.width())/2; oy=(L.height()-S.height())/2
+        if S.width()==0 or S.height()==0: self.status_label.setText("Cannot set ROI: Invalid image size."); return
+        if self.worker and self.worker.latest_frame is not None:
+            h0,w0=self.worker.latest_frame.shape[0], self.worker.latest_frame.shape[1]
+        else:
+            h0,w0=1080,1920
+        sx=w0/S.width(); sy=h0/S.height()
+        poly=[]
+        for pt in points:
+            x=int((pt.x()-ox)*sx); y=int((pt.y()-oy)*sy)
+            x=max(0,min(w0-1,x)); y=max(0,min(h0-1,y))
+            poly.append([x,y])
+        if len(poly) < 3:
+            self.status_label.setText("ROI polygon requires at least 3 points."); return
+        self.roi_poly = poly
+        self.roi = None
+        if self.worker:
+            self.worker.update_roi(None)
+            try:
+                self.worker.update_roi_poly(self.roi_poly)
+            except Exception:
+                pass
+        self.status_label.setText(f"ROI (poly) selected: {len(self.roi_poly)} points")
         self.save_config_with_roi(); self.clear_roi_button.setEnabled(True)
     def clear_roi(self):
         print(f"Entering MainWindow.clear_roi")
-        self.roi=None; self.image_display_label.clear_roi()
-        if self.worker: self.worker.update_roi(None)
+        self.roi=None; self.roi_poly=None; self.image_display_label.clear_roi()
+        if self.worker:
+            self.worker.update_roi(None)
+            try:
+                self.worker.update_roi_poly(None)
+            except Exception:
+                pass
         self.status_label.setText("ROI cleared. Detection will cover the full frame.")
         self.save_config_with_roi(); self.clear_roi_button.setEnabled(False)
     def capture_frame(self):
@@ -680,7 +839,7 @@ class MainWindow(QMainWindow):
         self.config['model_path']=self.model_path_input.text(); self.config['source_path']=self.source_path_input.text()
         self.config['threshold']=self.thresh_slider.value()/100.0; self.config['autosave']=self.autosave_checkbox.isChecked()
         self.config['fps_index']=self.fps_combo.currentIndex(); self.config['save_original']=self.save_original_checkbox.isChecked()
-        self.config['beep']=self.beep_checkbox.isChecked(); self.config['roi']=self.roi
+        self.config['beep']=self.beep_checkbox.isChecked(); self.config['roi']=self.roi; self.config['roi_poly']=self.roi_poly
         self.config['resolution_index']=self.resolution_combo.currentIndex(); self.config['low_latency']=self.low_latency_checkbox.isChecked()
         self.config['codec']=self.codec_combo.currentText(); save_config(self.config)
     def closeEvent(self, e):
