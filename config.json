@@ -10,22 +10,5 @@
     "resolution_index": 2,
     "low_latency": false,
     "codec": "XVID",
-    "roi_poly": [
-        [
-            884,
-            486
-        ],
-        [
-            1211,
-            480
-        ],
-        [
-            1214,
-            717
-        ],
-        [
-            922,
-            712
-        ]
-    ]
+    "roi_poly": null
 }
