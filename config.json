@@ -1,14 +1,14 @@
 {
-    "model_path": "D:/aiT/yolo11l.pt",
-    "source_path": "0",
+    "model_path": "D:/aiT/runs/detect/train/weights/best.pt",
+    "source_path": "1",
     "threshold": 0.39,
     "autosave": true,
     "fps_index": 1,
-    "save_original": false,
+    "save_original": true,
     "beep": false,
     "roi": null,
-    "resolution_index": 2,
+    "resolution_index": 1,
     "low_latency": false,
-    "codec": "XVID",
+    "codec": "Auto",
     "roi_poly": null
 }

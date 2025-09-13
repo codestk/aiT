@@ -496,11 +496,24 @@ class Worker(QObject):
         self.is_paused=paused
     def save_detection_images(self, original, detected, is_single_image=False):
         #print(f"Entering Worker.save_detection_images")
-        out = os.path.join('outputs','detections', self.session_timestamp); os.makedirs(out, exist_ok=True)
-        ts = int(time.time()*1000)
-        cv2.imwrite(os.path.join(out, f"detected_{ts}.png"), detected)
+        # Base output directory per session
+        base_out = os.path.join('outputs', 'detections', self.session_timestamp)
+        # Separate folders for detected (with boxes) and original frames
+        detect_dir = os.path.join(base_out, 'detect')
+        original_dir = os.path.join(base_out, 'original')
+        os.makedirs(detect_dir, exist_ok=True)
         if self.save_original_enabled:
-            cv2.imwrite(os.path.join(out, f"detection_{ts}_original.png"), original)
+            os.makedirs(original_dir, exist_ok=True)
+
+        # Use the same filename in both folders to pair images easily
+        ts = int(time.time() * 1000)
+        filename = f"detection_{ts}.png"
+
+        # Save detected image
+        cv2.imwrite(os.path.join(detect_dir, filename), detected)
+        # Optionally save original image with the same name
+        if self.save_original_enabled:
+            cv2.imwrite(os.path.join(original_dir, filename), original)
     def set_recording_state(self, state:bool):
         print(f"Entering Worker.set_recording_state")
         self.recording_request=state
