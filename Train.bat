@@ -26,8 +26,8 @@ echo [ขั้นตอนที่ 3/4] กำลังเริ่มกา�
 rem yolo detect train data=data.yaml model=yolo11m.pt epochs=60 imgsz=640
 
 rem    แม่นยำสูงสุดที่ 0.95 ++++   
-yolo detect train data=data.yaml model=yolov8s.pt epochs=200 imgsz=640
-rem yolo detect train data=data.yaml model=yolov8s.pt epochs=220 imgsz=960
+rem yolo detect train data=data.yaml model=yolov8m.pt epochs=200 imgsz=640
+yolo detect train data=data.yaml model=yolo11s.pt epochs=200 imgsz=640
 
  
 rem yolo detect train data=data.yaml model=yolov8s.pt epochs=100 imgsz=640   
