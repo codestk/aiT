@@ -1,5 +1,5 @@
 {
-    "model_path": "D:/aiT/runs/detect/train/weights/best.pt",
+    "model_path": "D:/aiT/Model/yolo11s_960.pt",
     "source_path": "0",
     "threshold": 0.39,
     "autosave": true,
@@ -9,6 +9,27 @@
     "roi": null,
     "resolution_index": 2,
     "low_latency": false,
-    "codec": "DIVX",
-    "roi_poly": null
+    "codec": "MJPG",
+    "roi_poly": [
+        [
+            207,
+            204
+        ],
+        [
+            850,
+            209
+        ],
+        [
+            1207,
+            216
+        ],
+        [
+            983,
+            362
+        ],
+        [
+            388,
+            374
+        ]
+    ]
 }

@@ -5,8 +5,8 @@ data: data.yaml
 epochs: 200
 time: null
 patience: 100
-batch: 16
-imgsz: 640
+batch: 2
+imgsz: 960
 save: true
 save_period: -1
 cache: false
